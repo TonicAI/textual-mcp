@@ -1,0 +1,47 @@
+{
+  "name": "@tonicai/textual-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for Tonic Textual PII detection and de-identification",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "textual-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch",
+    "prepublishOnly": "npm run build",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "mcp",
+    "tonic",
+    "textual",
+    "pii",
+    "redaction",
+    "de-identification",
+    "model-context-protocol"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TonicAI/textual-mcp"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "mime-types": "^2.1.35"
+  },
+  "devDependencies": {
+    "@types/mime-types": "^2.1.4",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}

@@ -1,0 +1,8 @@
+src/
+logs/
+.claude/
+.DS_Store
+tsconfig.json
+claude-mcp-config.json
+CLAUDE.md
+README.md

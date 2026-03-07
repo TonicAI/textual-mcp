@@ -1,0 +1,7 @@
+node_modules/
+dist/
+logs/
+.claude/
+claude-mcp-config.json
+*.tgz
+.DS_Store
