@@ -92,6 +92,11 @@ export interface RedactOptions {
   recordApiRequest?: boolean;
 }
 
+export interface JsonRedactOptions extends RedactOptions {
+  jsonPathAllowLists?: Record<string, string[]>;
+  jsonPathIgnorePaths?: string[];
+}
+
 class Semaphore {
   private queue: Array<() => void> = [];
   private active = 0;
@@ -213,10 +218,16 @@ export class TextualClient {
     });
   }
 
-  async redactJson(jsonString: string, opts: RedactOptions = {}): Promise<RedactionResponse> {
+  async redactJson(jsonString: string, opts: JsonRedactOptions = {}): Promise<RedactionResponse> {
+    const payload: Record<string, unknown> = {
+      ...this.redactPayload(opts),
+      jsonText: jsonString,
+    };
+    if (opts.jsonPathAllowLists) payload.jsonPathAllowLists = opts.jsonPathAllowLists;
+    if (opts.jsonPathIgnorePaths) payload.jsonPathIgnorePaths = opts.jsonPathIgnorePaths;
     return this.json("/api/Redact/json", {
       method: "POST",
-      body: JSON.stringify({ ...this.redactPayload(opts), jsonText: jsonString }),
+      body: JSON.stringify(payload),
     });
   }
 
