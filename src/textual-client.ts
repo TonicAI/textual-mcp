@@ -144,6 +144,12 @@ export class TextualClient {
     this.semaphore = new Semaphore(maxConcurrent);
   }
 
+  private isRetryableError(err: unknown): boolean {
+    if (err instanceof TypeError) return true; // fetch network errors
+    const code = (err as NodeJS.ErrnoException)?.code;
+    return code === "ECONNRESET" || code === "ECONNREFUSED" || code === "UND_ERR_SOCKET" || code === "EPIPE";
+  }
+
   private async request(
     endpoint: string,
     options: RequestInit = {},
@@ -159,25 +165,38 @@ export class TextualClient {
     const start = Date.now();
     this.logger?.info("api_request_start", { method, endpoint, inflight: this.semaphore.inflight, pending: this.semaphore.pending });
     try {
-      const res = await fetch(url, { ...options, headers, signal });
-      const durationMs = Date.now() - start;
-      if (!res.ok) {
-        const body = await res.text().catch(() => "");
-        this.logger?.error("api_request_error", { method, endpoint, status: res.status, body, durationMs });
-        let detail = body;
+      let lastErr: unknown;
+      for (let attempt = 0; attempt < 2; attempt++) {
         try {
-          const parsed = JSON.parse(body);
-          detail = parsed.message || parsed.detail || parsed.title || body;
-        } catch {
-          // body is plain text, use as-is
+          const res = await fetch(url, { ...options, headers, signal });
+          const durationMs = Date.now() - start;
+          if (!res.ok) {
+            const body = await res.text().catch(() => "");
+            this.logger?.error("api_request_error", { method, endpoint, status: res.status, body, durationMs });
+            let detail = body;
+            try {
+              const parsed = JSON.parse(body);
+              detail = parsed.message || parsed.detail || parsed.title || body;
+            } catch {
+              // body is plain text, use as-is
+            }
+            const err = new Error(detail);
+            (err as any).statusCode = res.status;
+            (err as any).endpoint = endpoint;
+            throw err;
+          }
+          this.logger?.info("api_request_complete", { method, endpoint, status: res.status, durationMs });
+          return res;
+        } catch (err) {
+          if (attempt === 0 && this.isRetryableError(err)) {
+            this.logger?.info("api_request_retry", { method, endpoint, error: String(err), attempt: attempt + 1 });
+            lastErr = err;
+            continue;
+          }
+          throw err;
         }
-        const err = new Error(detail);
-        (err as any).statusCode = res.status;
-        (err as any).endpoint = endpoint;
-        throw err;
       }
-      this.logger?.info("api_request_complete", { method, endpoint, status: res.status, durationMs });
-      return res;
+      throw lastErr;
     } finally {
       this.semaphore.release();
     }

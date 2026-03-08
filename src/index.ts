@@ -2,6 +2,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { InMemoryTaskStore } from "@modelcontextprotocol/sdk/experimental/tasks";
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
@@ -30,6 +31,8 @@ if (!API_KEY) {
 
 const logger = new Logger();
 const MAX_CONCURRENT = parseInt(process.env.TONIC_TEXTUAL_MAX_CONCURRENT_REQUESTS || "50", 10);
+const POLL_INTERVAL_MS = 5000;
+const POLL_TIMEOUT_S = parseInt(process.env.TONIC_TEXTUAL_POLL_TIMEOUT_SECONDS || "900", 10);
 const client = new TextualClient(BASE_URL, API_KEY, logger, MAX_CONCURRENT);
 
 // --- Shared schemas ---
@@ -141,7 +144,8 @@ function toTimeSpan(input: string): string {
 }
 
 // Helper: poll for file processing completion then download
-async function pollAndDownload(jobId: string, opts: RedactOptions, signal?: AbortSignal, maxAttempts = 30): Promise<Buffer> {
+async function pollAndDownload(jobId: string, opts: RedactOptions, signal?: AbortSignal): Promise<Buffer> {
+  const maxAttempts = Math.ceil(POLL_TIMEOUT_S / (POLL_INTERVAL_MS / 1000));
   for (let i = 0; i < maxAttempts; i++) {
     signal?.throwIfAborted();
     try {
@@ -150,13 +154,13 @@ async function pollAndDownload(jobId: string, opts: RedactOptions, signal?: Abor
       // 409 means still processing — retry after delay
       if ((err as any)?.statusCode === 409) {
         logger.info("poll_retry", { jobId, attempt: i + 1, maxAttempts });
-        await new Promise((r) => setTimeout(r, 2000));
+        await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
         continue;
       }
       throw err;
     }
   }
-  throw new Error(`File processing timed out after ${maxAttempts * 2} seconds for job ${jobId}`);
+  throw new Error(`File processing timed out after ${POLL_TIMEOUT_S} seconds for job ${jobId}`);
 }
 
 // ============================================================
@@ -273,39 +277,82 @@ function registerTools(s: McpServer) {
     })
   );
 
-  // --- redact_file ---
-  s.tool(
+  // --- redact_file (task-based: uploads immediately, processes in background) ---
+  s.experimental.tasks.registerToolTask(
     "redact_file",
-    `Redact PII from a single binary file (PDF, docx, xlsx, images). Uploads the file to Textual, waits for processing, and saves the redacted version.
+    {
+      description: `Redact PII from a single binary file (PDF, docx, xlsx, images). Uploads the file to Textual and processes in the background — does NOT block while waiting.
 
 Do NOT use this for text-based files (.txt, .json, .xml, .html, .htm, .csv, .tsv). Use redact_text, redact_json, redact_xml, or redact_html instead — they are faster and return inline results.
 
 IMPORTANT: If you need to redact multiple files or an entire directory, use deidentify_folder instead — do NOT call this tool in a loop or write a script to iterate over files.
 
 Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
-    {
-      filePath: z.string().describe("Absolute path to the file to redact"),
-      outputPath: z.string().describe("Absolute path where the redacted file should be saved"),
-      ...redactOptionSchemas,
+      inputSchema: {
+        filePath: z.string().describe("Absolute path to the file to redact"),
+        outputPath: z.string().describe("Absolute path where the redacted file should be saved"),
+        ...redactOptionSchemas,
+      },
+      execution: { taskSupport: "optional" as const },
     },
-    withLogging(logger, "redact_file", async (params, extra) => {
-      const signal: AbortSignal | undefined = extra?.signal;
-      if (!fs.existsSync(params.filePath)) {
-        return { content: [{ type: "text" as const, text: `Error: File not found: ${params.filePath}` }], isError: true };
-      }
-      const ext = path.extname(params.filePath).toLowerCase();
-      const textTypes = [".txt", ".json", ".html", ".htm", ".xml", ".csv", ".tsv"];
-      if (textTypes.includes(ext)) {
-        return { content: [{ type: "text" as const, text: `Error: ${ext} files should be redacted using the text-based redaction tools (redact_text, redact_json, redact_xml, redact_html) which are faster and return inline results.` }], isError: true };
-      }
-      const job = await client.startFileRedaction(params.filePath, signal);
-      const opts = buildRedactOpts(params);
-      const buffer = await pollAndDownload(job.jobId, opts, signal);
-      const dir = path.dirname(params.outputPath);
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(params.outputPath, buffer);
-      return { content: [{ type: "text" as const, text: `Redacted file saved to: ${params.outputPath} (${buffer.length} bytes)` }] };
-    })
+    {
+      createTask: async (params, extra) => {
+        logger.logToolCall("redact_file", params as Record<string, unknown>);
+        if (!fs.existsSync(params.filePath)) {
+          throw new Error(`File not found: ${params.filePath}`);
+        }
+        const ext = path.extname(params.filePath).toLowerCase();
+        const textTypes = [".txt", ".json", ".html", ".htm", ".xml", ".csv", ".tsv"];
+        if (textTypes.includes(ext)) {
+          throw new Error(`${ext} files should be redacted using the text-based redaction tools (redact_text, redact_json, redact_xml, redact_html) which are faster and return inline results.`);
+        }
+
+        const job = await client.startFileRedaction(params.filePath);
+        const opts = buildRedactOpts(params);
+        const task = await extra.taskStore.createTask({ ttl: (POLL_TIMEOUT_S + 60) * 1000, pollInterval: POLL_INTERVAL_MS });
+        logger.info("redact_file_task_created", { taskId: task.taskId, jobId: job.jobId, file: params.filePath });
+
+        // Background: poll for completion, download, save
+        (async () => {
+          try {
+            const buffer = await pollAndDownload(job.jobId, opts);
+            const dir = path.dirname(params.outputPath);
+            if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+            fs.writeFileSync(params.outputPath, buffer);
+            logger.info("redact_file_task_complete", { taskId: task.taskId, outputPath: params.outputPath, bytes: buffer.length });
+            await extra.taskStore.storeTaskResult(task.taskId, "completed", {
+              content: [{ type: "text" as const, text: `Redacted file saved to: ${params.outputPath} (${buffer.length} bytes)` }],
+            });
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            logger.error("redact_file_task_error", { taskId: task.taskId, error: msg });
+            try {
+              await extra.taskStore.storeTaskResult(task.taskId, "failed", {
+                content: [{ type: "text" as const, text: `Error redacting file: ${msg}` }],
+                isError: true,
+              });
+            } catch (storeErr) {
+              logger.error("redact_file_task_store_error", {
+                taskId: task.taskId,
+                originalError: msg,
+                storeError: storeErr instanceof Error ? storeErr.message : String(storeErr),
+              });
+            }
+          }
+        })();
+
+        return { task };
+      },
+      getTask: async (_args, extra) => {
+        const task = await extra.taskStore.getTask(extra.taskId);
+        if (!task) throw new Error(`Task not found: ${extra.taskId}`);
+        return task;
+      },
+      getTaskResult: async (_args, extra) => {
+        const result = await extra.taskStore.getTaskResult(extra.taskId);
+        return result as { content: Array<{ type: "text"; text: string }> };
+      },
+    }
   );
 
   // --- list_file_jobs ---
@@ -742,7 +789,9 @@ async function main() {
   } | null = null;
 
   function createSession(): { server: McpServer; transport: StreamableHTTPServerTransport } {
-    const server = new McpServer({ name: "tonic-textual", version: "1.0.0" });
+    const server = new McpServer({ name: "tonic-textual", version: "1.0.0" }, {
+      taskStore: new InMemoryTaskStore(),
+    });
     registerTools(server);
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
