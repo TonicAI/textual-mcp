@@ -120,10 +120,11 @@ function buildRedactOpts(params: {
 }
 
 // Helper: poll for file processing completion then download
-async function pollAndDownload(jobId: string, opts: RedactOptions, maxAttempts = 30): Promise<Buffer> {
+async function pollAndDownload(jobId: string, opts: RedactOptions, signal?: AbortSignal, maxAttempts = 30): Promise<Buffer> {
   for (let i = 0; i < maxAttempts; i++) {
+    signal?.throwIfAborted();
     try {
-      return await client.downloadRedactedFile(jobId, opts);
+      return await client.downloadRedactedFile(jobId, opts, signal);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       // 409 means still processing
@@ -146,7 +147,7 @@ function registerTools(s: McpServer) {
   // --- redact_text ---
   s.tool(
     "redact_text",
-    "Redact PII from a plain text string. Returns the de-identified text and details about each detected entity.",
+    "Redact PII from a single plain text string. Returns the de-identified text and details about each detected entity. If you need to redact multiple files or an entire directory, use deidentify_folder instead — do NOT call this tool in a loop.",
     { text: z.string().describe("The text to de-identify"), ...redactOptionSchemas },
     withLogging(logger, "redact_text", async (params) => {
       const result = await client.redactText(params.text, buildRedactOpts(params));
@@ -176,7 +177,7 @@ function registerTools(s: McpServer) {
   // --- redact_json ---
   s.tool(
     "redact_json",
-    "Redact PII from a JSON string. Preserves JSON structure, only redacts text values. Supports JSONPath-based allow lists and ignore paths for fine-grained control.",
+    "Redact PII from a single JSON string. Preserves JSON structure, only redacts text values. Supports JSONPath-based allow lists and ignore paths for fine-grained control. Use this to test options on ONE sample file, then pass those same options (including jsonPathIgnorePaths/jsonPathAllowLists) to deidentify_folder to process the full directory. Do NOT call this in a loop or write a script.",
     {
       jsonText: z.string().describe("The JSON string to de-identify"),
       ...redactOptionSchemas,
@@ -212,7 +213,7 @@ function registerTools(s: McpServer) {
   // --- redact_xml ---
   s.tool(
     "redact_xml",
-    "Redact PII from an XML string. Preserves XML structure, only redacts text values and attributes.",
+    "Redact PII from a single XML string. Preserves XML structure, only redacts text values and attributes. For multiple files, use deidentify_folder instead.",
     { xmlText: z.string().describe("The XML string to de-identify"), ...redactOptionSchemas },
     withLogging(logger, "redact_xml", async (params) => {
       const result = await client.redactXml(params.xmlText, buildRedactOpts(params));
@@ -228,7 +229,7 @@ function registerTools(s: McpServer) {
   // --- redact_html ---
   s.tool(
     "redact_html",
-    "Redact PII from an HTML string. Preserves HTML structure, only redacts text content.",
+    "Redact PII from a single HTML string. Preserves HTML structure, only redacts text content. For multiple files, use deidentify_folder instead.",
     { htmlText: z.string().describe("The HTML string to de-identify"), ...redactOptionSchemas },
     withLogging(logger, "redact_html", async (params) => {
       const result = await client.redactHtml(params.htmlText, buildRedactOpts(params));
@@ -255,9 +256,11 @@ function registerTools(s: McpServer) {
   // --- redact_file ---
   s.tool(
     "redact_file",
-    `Redact PII from a binary file (PDF, docx, xlsx, images). Uploads the file to Textual, waits for processing, and saves the redacted version.
+    `Redact PII from a single binary file (PDF, docx, xlsx, images). Uploads the file to Textual, waits for processing, and saves the redacted version.
 
 Do NOT use this for text-based files (.txt, .json, .xml, .html, .htm, .csv, .tsv). Use redact_text, redact_json, redact_xml, or redact_html instead — they are faster and return inline results.
+
+IMPORTANT: If you need to redact multiple files or an entire directory, use deidentify_folder instead — do NOT call this tool in a loop or write a script to iterate over files.
 
 Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
     {
@@ -265,7 +268,8 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
       outputPath: z.string().describe("Absolute path where the redacted file should be saved"),
       ...redactOptionSchemas,
     },
-    withLogging(logger, "redact_file", async (params) => {
+    withLogging(logger, "redact_file", async (params, extra) => {
+      const signal: AbortSignal | undefined = extra?.signal;
       if (!fs.existsSync(params.filePath)) {
         return { content: [{ type: "text" as const, text: `Error: File not found: ${params.filePath}` }], isError: true };
       }
@@ -274,9 +278,9 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
       if (textTypes.includes(ext)) {
         return { content: [{ type: "text" as const, text: `Error: ${ext} files should be redacted using the text-based redaction tools (redact_text, redact_json, redact_xml, redact_html) which are faster and return inline results.` }], isError: true };
       }
-      const job = await client.startFileRedaction(params.filePath);
+      const job = await client.startFileRedaction(params.filePath, signal);
       const opts = buildRedactOpts(params);
-      const buffer = await pollAndDownload(job.jobId, opts);
+      const buffer = await pollAndDownload(job.jobId, opts, signal);
       const dir = path.dirname(params.outputPath);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(params.outputPath, buffer);
@@ -444,33 +448,50 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
   // --- deidentify_folder ---
   s.tool(
     "deidentify_folder",
-    `De-identify an entire folder tree. Processes all files through Tonic Textual and writes redacted versions to an output directory, preserving the folder structure. Optionally de-identifies folder and file names too.
+    `De-identify an entire folder tree in a single call. This is the PREFERRED tool whenever the user wants to redact, de-identify, or anonymize multiple files or a directory. Do NOT loop over files calling redact_text/redact_file individually, and do NOT write scripts to batch-process files — use this tool instead.
 
-This tool:
+This tool handles everything:
 1. Walks the source directory tree
-2. For each file: uploads to Textual, downloads the redacted version
-3. Optionally redacts folder/file names using Textual's text redaction
-4. Writes everything to the output directory preserving structure
+2. Automatically picks the right redaction method per file type (text, JSON, HTML, XML, PDF, docx, images, etc.)
+3. Supports JSON-specific options (jsonPathIgnorePaths, jsonPathAllowLists) — any options you tested with redact_json work here too
+4. Processes files in parallel for speed
+5. Set deidentifyNames=true to redact PII in folder and file names (e.g. "Dad_15084238708" → "Uncle_96771033448")
+6. Writes everything to the output directory preserving folder structure
 
-Use scan_directory first to preview what will be processed. Use redact_text or redact_file on individual items first to tune your generatorConfig before running this on the full folder.`,
+Recommended workflow: use scan_directory to preview, test redact_text/redact_json on ONE sample file to tune options, then call THIS tool with those same options to process the full folder. After testing a sample, your next step should ALWAYS be deidentify_folder — not a script.`,
     {
       sourcePath: z.string().describe("Absolute path to the source directory"),
       outputPath: z.string().describe("Absolute path to the output directory (will be created)"),
       deidentifyNames: z.boolean().optional().default(false).describe("If true, also de-identify folder and file names by running them through Textual text redaction"),
       ...redactOptionSchemas,
+      jsonPathAllowLists: z
+        .record(z.string(), z.array(z.string()))
+        .optional()
+        .describe(
+          "For JSON files only: map of entity type labels to arrays of JSONPath expressions. Values at these paths are force-detected as the given entity type."
+        ),
+      jsonPathIgnorePaths: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "For JSON files only: array of JSONPath expressions for values that should NOT be redacted. Example: [\"$[*].id\", \"$[*].timestamp\"]"
+        ),
       fileExtensions: z.array(z.string()).optional().describe("If provided, only process files with these extensions (e.g. ['.pdf', '.docx', '.txt']). Others are skipped."),
       skipPatterns: z.array(z.string()).optional().describe("Glob-like patterns of files/folders to skip (e.g. ['node_modules', '.git', '*.log'])"),
     },
     withLogging(logger, "deidentify_folder", async ({
       sourcePath, outputPath, deidentifyNames,
       generatorConfig, generatorDefault, generatorMetadata, customEntities, labelBlockLists, labelAllowLists,
+      jsonPathAllowLists, jsonPathIgnorePaths,
       fileExtensions, skipPatterns,
-    }) => {
+    }, extra) => {
+      const signal: AbortSignal | undefined = extra?.signal;
       if (!fs.existsSync(sourcePath)) {
         return { content: [{ type: "text" as const, text: `Error: Source directory not found: ${sourcePath}` }], isError: true };
       }
 
       const opts = buildRedactOpts({ generatorConfig, generatorDefault, generatorMetadata, customEntities, labelBlockLists, labelAllowLists });
+      const jsonOpts: JsonRedactOptions = { ...opts, jsonPathAllowLists, jsonPathIgnorePaths };
       const results: Array<{ source: string; output: string; status: "success" | "skipped" | "error"; error?: string }> = [];
       const nameCache = new Map<string, string>();
 
@@ -481,7 +502,7 @@ Use scan_directory first to preview what will be processed. Use redact_text or r
         const baseName = ext ? name.slice(0, -ext.length) : name;
         try {
           logger.info("name_redact_start", { tool: "deidentify_folder", name });
-          const result = await client.redactText(baseName, { ...opts, generatorDefault: opts.generatorDefault || "Synthesis" });
+          const result = await client.redactText(baseName, { ...opts, generatorDefault: opts.generatorDefault || "Synthesis" }, signal);
           const newBase = result.deIdentifyResults && result.deIdentifyResults.length > 0 ? result.redactedText : baseName;
           const newName = ext ? newBase + ext : newBase;
           nameCache.set(name, newName);
@@ -520,8 +541,10 @@ Use scan_directory first to preview what will be processed. Use redact_text or r
 
       // Phase 1: Walk tree, create output directories, collect work items
       async function collectWork(srcDir: string, outDir: string) {
+        signal?.throwIfAborted();
         const items = fs.readdirSync(srcDir, { withFileTypes: true });
         for (const item of items) {
+          signal?.throwIfAborted();
           const srcFull = path.join(srcDir, item.name);
           const relPath = path.relative(sourcePath, srcFull);
           if (shouldSkip(relPath)) {
@@ -562,21 +585,23 @@ Use scan_directory first to preview what will be processed. Use redact_text or r
 
       // Phase 2: Process text files in parallel
       async function processTextItem(item: WorkItem) {
+        if (signal?.aborted) return;
         const fileStart = Date.now();
         logger.info("file_redact_start", { tool: "deidentify_folder", file: item.relPath, ext: item.ext, mode: "text" });
         try {
           const content = fs.readFileSync(item.srcFull, "utf-8");
           let result: { redactedText: string };
-          if (item.ext === ".json") result = await client.redactJson(content, opts);
-          else if (item.ext === ".html" || item.ext === ".htm") result = await client.redactHtml(content, opts);
-          else if (item.ext === ".xml") result = await client.redactXml(content, opts);
-          else result = await client.redactText(content, opts);
+          if (item.ext === ".json") result = await client.redactJson(content, jsonOpts, signal);
+          else if (item.ext === ".html" || item.ext === ".htm") result = await client.redactHtml(content, opts, signal);
+          else if (item.ext === ".xml") result = await client.redactXml(content, opts, signal);
+          else result = await client.redactText(content, opts, signal);
           const redactedBuf = Buffer.from(result.redactedText, "utf-8");
           fs.mkdirSync(path.dirname(item.outFilePath), { recursive: true });
           fs.writeFileSync(item.outFilePath, redactedBuf);
           logger.info("file_redact_complete", { tool: "deidentify_folder", file: item.relPath, outputBytes: redactedBuf.length, durationMs: Date.now() - fileStart });
           results.push({ source: item.relPath, output: path.relative(outputPath, item.outFilePath), status: "success" });
         } catch (err: unknown) {
+          if (err instanceof DOMException && err.name === "AbortError") return;
           const msg = err instanceof Error ? err.message : String(err);
           logger.error("file_redact_error", { tool: "deidentify_folder", file: item.relPath, error: msg });
           results.push({ source: item.relPath, output: "", status: "error", error: msg });
@@ -586,49 +611,73 @@ Use scan_directory first to preview what will be processed. Use redact_text or r
       const textPromises = textItems.map((item) => processTextItem(item));
 
       // Phase 3: Upload binary files serially (fast), collect job IDs
-      const binaryJobs: Array<{ item: WorkItem; jobId: string }> = [];
-      for (const item of binaryItems) {
-        const fileStart = Date.now();
-        logger.info("file_redact_start", { tool: "deidentify_folder", file: item.relPath, ext: item.ext, mode: "file_upload" });
-        try {
-          const job = await client.startFileRedaction(item.srcFull);
-          logger.info("file_upload_complete", { tool: "deidentify_folder", file: item.relPath, jobId: job.jobId, durationMs: Date.now() - fileStart });
-          binaryJobs.push({ item, jobId: job.jobId });
-        } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
-          logger.error("file_upload_error", { tool: "deidentify_folder", file: item.relPath, error: msg });
-          results.push({ source: item.relPath, output: "", status: "error", error: msg });
+      // Wrapped in async so that if it throws (e.g. abort), we still await textPromises
+      async function uploadAndProcessBinaryFiles() {
+        const binaryJobs: Array<{ item: WorkItem; jobId: string }> = [];
+        for (const item of binaryItems) {
+          signal?.throwIfAborted();
+          const fileStart = Date.now();
+          logger.info("file_redact_start", { tool: "deidentify_folder", file: item.relPath, ext: item.ext, mode: "file_upload" });
+          try {
+            const job = await client.startFileRedaction(item.srcFull, signal);
+            logger.info("file_upload_complete", { tool: "deidentify_folder", file: item.relPath, jobId: job.jobId, durationMs: Date.now() - fileStart });
+            binaryJobs.push({ item, jobId: job.jobId });
+          } catch (err: unknown) {
+            if (err instanceof DOMException && err.name === "AbortError") throw err;
+            const msg = err instanceof Error ? err.message : String(err);
+            logger.error("file_upload_error", { tool: "deidentify_folder", file: item.relPath, error: msg });
+            results.push({ source: item.relPath, output: "", status: "error", error: msg });
+          }
         }
+
+        // Phase 4: Poll and download binary files in parallel
+        const binaryPromises = binaryJobs.map(({ item, jobId }) => {
+          if (signal?.aborted) return Promise.resolve();
+          const dlStart = Date.now();
+          return pollAndDownload(jobId, opts, signal).then((redactedBuf) => {
+            fs.mkdirSync(path.dirname(item.outFilePath), { recursive: true });
+            fs.writeFileSync(item.outFilePath, redactedBuf);
+            logger.info("file_redact_complete", { tool: "deidentify_folder", file: item.relPath, outputBytes: redactedBuf.length, durationMs: Date.now() - dlStart });
+            results.push({ source: item.relPath, output: path.relative(outputPath, item.outFilePath), status: "success" });
+          }).catch((err: unknown) => {
+            if (err instanceof DOMException && err.name === "AbortError") return;
+            const msg = err instanceof Error ? err.message : String(err);
+            logger.error("file_redact_error", { tool: "deidentify_folder", file: item.relPath, error: msg });
+            results.push({ source: item.relPath, output: "", status: "error", error: msg });
+          });
+        });
+        await Promise.all(binaryPromises);
       }
 
-      // Phase 4: Poll and download binary files in parallel
-      async function processBinaryJob({ item, jobId }: { item: WorkItem; jobId: string }) {
-        const dlStart = Date.now();
-        try {
-          const redactedBuf = await pollAndDownload(jobId, opts);
-          fs.mkdirSync(path.dirname(item.outFilePath), { recursive: true });
-          fs.writeFileSync(item.outFilePath, redactedBuf);
-          logger.info("file_redact_complete", { tool: "deidentify_folder", file: item.relPath, outputBytes: redactedBuf.length, durationMs: Date.now() - dlStart });
-          results.push({ source: item.relPath, output: path.relative(outputPath, item.outFilePath), status: "success" });
-        } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
-          logger.error("file_redact_error", { tool: "deidentify_folder", file: item.relPath, error: msg });
-          results.push({ source: item.relPath, output: "", status: "error", error: msg });
-        }
-      }
+      // Await all work, using allSettled to ensure no unhandled rejections on abort
+      const binaryWork = uploadAndProcessBinaryFiles();
+      await Promise.allSettled([...textPromises, binaryWork]);
 
-      const binaryPromises = binaryJobs.map((job) => processBinaryJob(job));
-      await Promise.all([...textPromises, ...binaryPromises]);
-
+      const cancelled = signal?.aborted ?? false;
       const successCount = results.filter((r) => r.status === "success").length;
       const errorCount = results.filter((r) => r.status === "error").length;
       const skippedCount = results.filter((r) => r.status === "skipped").length;
+
+      if (cancelled) {
+        logger.info("deidentify_folder_cancelled", {
+          tool: "deidentify_folder",
+          succeeded: successCount,
+          totalFiles: textItems.length + binaryItems.length,
+        });
+      }
 
       return {
         content: [{
           type: "text" as const,
           text: JSON.stringify({
-            summary: { totalProcessed: results.length, succeeded: successCount, failed: errorCount, skipped: skippedCount },
+            summary: {
+              ...(cancelled ? { cancelled: true } : {}),
+              totalFiles: textItems.length + binaryItems.length,
+              totalProcessed: results.length,
+              succeeded: successCount,
+              failed: errorCount,
+              skipped: skippedCount,
+            },
             outputDirectory: outputPath,
             results,
           }, null, 2),
@@ -644,15 +693,22 @@ Use scan_directory first to preview what will be processed. Use redact_text or r
 async function main() {
   const port = parseInt(process.env.PORT || "3000", 10);
 
-  const server = new McpServer({
-    name: "tonic-textual",
-    version: "1.0.0",
-  });
+  // Each session gets its own McpServer + Transport pair so that
+  // in-flight request state, abort controllers, and response handlers
+  // are fully isolated between sessions.
+  let currentSession: {
+    server: McpServer;
+    transport: StreamableHTTPServerTransport;
+  } | null = null;
 
-  registerTools(server);
-
-  // Track the current transport — a new one is created per session/initialization.
-  let currentTransport: StreamableHTTPServerTransport | null = null;
+  function createSession(): { server: McpServer; transport: StreamableHTTPServerTransport } {
+    const server = new McpServer({ name: "tonic-textual", version: "1.0.0" });
+    registerTools(server);
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+    });
+    return { server, transport };
+  }
 
   const httpServer = createServer(async (req, res) => {
     const url = new URL(req.url || "/", `http://localhost:${port}`);
@@ -661,30 +717,29 @@ async function main() {
 
     if (url.pathname === "/mcp") {
       try {
-        // Route to existing transport if session matches
-        if (sessionId && currentTransport?.sessionId === sessionId) {
-          await currentTransport.handleRequest(req, res);
+        // Route to existing session if session ID matches
+        if (sessionId && currentSession?.transport.sessionId === sessionId) {
+          await currentSession.transport.handleRequest(req, res);
           return;
         }
 
         // New initialization: POST without session header
         if (req.method === "POST" && !sessionId) {
           logger.info("new_session", { reason: "POST without session header" });
-          if (currentTransport) {
-            logger.info("closing_previous_session", { previousSessionId: currentTransport.sessionId });
-            await currentTransport.close();
+          if (currentSession) {
+            logger.info("closing_previous_session", { previousSessionId: currentSession.transport.sessionId });
+            await currentSession.server.close();
           }
-          currentTransport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: () => randomUUID(),
-          });
-          await server.connect(currentTransport);
-          await currentTransport.handleRequest(req, res);
-          logger.info("session_established", { sessionId: currentTransport.sessionId });
+          const session = createSession();
+          await session.server.connect(session.transport);
+          currentSession = session;
+          await session.transport.handleRequest(req, res);
+          logger.info("session_established", { sessionId: session.transport.sessionId });
           return;
         }
 
         // Invalid/stale session or wrong method for no-session request
-        logger.info("session_not_found", { method: req.method, sessionId: sessionId || null, currentSessionId: currentTransport?.sessionId || null });
+        logger.info("session_not_found", { method: req.method, sessionId: sessionId || null, currentSessionId: currentSession?.transport.sessionId || null });
         res.writeHead(404, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32001, message: "Session not found" }, id: null }));
       } catch (err) {
@@ -710,6 +765,14 @@ async function main() {
     logger.info("Tonic Textual MCP server running on HTTP", { port, endpoint: "/mcp" });
   });
 }
+
+process.on("uncaughtException", (err) => {
+  logger.error("uncaught_exception", { error: String(err), stack: err.stack });
+});
+
+process.on("unhandledRejection", (reason) => {
+  logger.error("unhandled_rejection", { error: String(reason), stack: reason instanceof Error ? reason.stack : undefined });
+});
 
 main().catch((err) => {
   logger.error("Fatal error", { error: String(err) });

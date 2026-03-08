@@ -185,6 +185,13 @@ export function withLogging<TArgs extends Record<string, unknown>, TResult>(
       logger.logToolResult(toolName, Date.now() - start, true);
       return result;
     } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") {
+        logger.logToolResult(toolName, Date.now() - start, false, "cancelled");
+        return {
+          content: [{ type: "text" as const, text: "Operation cancelled." }],
+          isError: true,
+        } as TResult;
+      }
       const msg = err instanceof Error ? err.message : String(err);
       const statusCode = (err as any)?.statusCode;
       const endpoint = (err as any)?.endpoint;

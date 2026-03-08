@@ -146,7 +146,8 @@ export class TextualClient {
 
   private async request(
     endpoint: string,
-    options: RequestInit = {}
+    options: RequestInit = {},
+    signal?: AbortSignal
   ): Promise<Response> {
     const url = `${this.baseUrl}${endpoint}`;
     const method = options.method || "GET";
@@ -158,7 +159,7 @@ export class TextualClient {
     const start = Date.now();
     this.logger?.info("api_request_start", { method, endpoint, inflight: this.semaphore.inflight, pending: this.semaphore.pending });
     try {
-      const res = await fetch(url, { ...options, headers });
+      const res = await fetch(url, { ...options, headers, signal });
       const durationMs = Date.now() - start;
       if (!res.ok) {
         const body = await res.text().catch(() => "");
@@ -182,12 +183,12 @@ export class TextualClient {
     }
   }
 
-  private async json<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+  private async json<T>(endpoint: string, options: RequestInit = {}, signal?: AbortSignal): Promise<T> {
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       ...((options.headers as Record<string, string>) || {}),
     };
-    const res = await this.request(endpoint, { ...options, headers });
+    const res = await this.request(endpoint, { ...options, headers }, signal);
     return res.json() as Promise<T>;
   }
 
@@ -204,21 +205,21 @@ export class TextualClient {
     return payload;
   }
 
-  async redactText(text: string, opts: RedactOptions = {}): Promise<RedactionResponse> {
+  async redactText(text: string, opts: RedactOptions = {}, signal?: AbortSignal): Promise<RedactionResponse> {
     return this.json("/api/Redact", {
       method: "POST",
       body: JSON.stringify({ ...this.redactPayload(opts), text }),
-    });
+    }, signal);
   }
 
-  async redactBulk(texts: string[], opts: RedactOptions = {}): Promise<BulkRedactionResponse> {
+  async redactBulk(texts: string[], opts: RedactOptions = {}, signal?: AbortSignal): Promise<BulkRedactionResponse> {
     return this.json("/api/Redact/bulk", {
       method: "POST",
       body: JSON.stringify({ ...this.redactPayload(opts), bulkText: texts }),
-    });
+    }, signal);
   }
 
-  async redactJson(jsonString: string, opts: JsonRedactOptions = {}): Promise<RedactionResponse> {
+  async redactJson(jsonString: string, opts: JsonRedactOptions = {}, signal?: AbortSignal): Promise<RedactionResponse> {
     const payload: Record<string, unknown> = {
       ...this.redactPayload(opts),
       jsonText: jsonString,
@@ -228,21 +229,21 @@ export class TextualClient {
     return this.json("/api/Redact/json", {
       method: "POST",
       body: JSON.stringify(payload),
-    });
+    }, signal);
   }
 
-  async redactXml(xmlString: string, opts: RedactOptions = {}): Promise<RedactionResponse> {
+  async redactXml(xmlString: string, opts: RedactOptions = {}, signal?: AbortSignal): Promise<RedactionResponse> {
     return this.json("/api/Redact/xml", {
       method: "POST",
       body: JSON.stringify({ ...this.redactPayload(opts), xmlText: xmlString }),
-    });
+    }, signal);
   }
 
-  async redactHtml(htmlString: string, opts: RedactOptions = {}): Promise<RedactionResponse> {
+  async redactHtml(htmlString: string, opts: RedactOptions = {}, signal?: AbortSignal): Promise<RedactionResponse> {
     return this.json("/api/Redact/html", {
       method: "POST",
       body: JSON.stringify({ ...this.redactPayload(opts), htmlText: htmlString }),
-    });
+    }, signal);
   }
 
   // --- PII Types ---
@@ -253,7 +254,7 @@ export class TextualClient {
 
   // --- File Redaction (Unattached) ---
 
-  async startFileRedaction(filePath: string): Promise<FileRedactionJob> {
+  async startFileRedaction(filePath: string, signal?: AbortSignal): Promise<FileRedactionJob> {
     const fileName = path.basename(filePath);
     const fileBuffer = fs.readFileSync(filePath);
     const mimeType = lookup(filePath) || "application/octet-stream";
@@ -276,7 +277,7 @@ export class TextualClient {
     const res = await this.request("/api/unattachedfile/upload", {
       method: "POST",
       body: formData,
-    });
+    }, signal);
     const data = await res.json();
     return { jobId: data.jobId ?? data.id, fileName };
   }
@@ -297,13 +298,14 @@ export class TextualClient {
 
   async downloadRedactedFile(
     jobId: string,
-    opts: RedactOptions = {}
+    opts: RedactOptions = {},
+    signal?: AbortSignal
   ): Promise<Buffer> {
     const res = await this.request(`/api/unattachedfile/${jobId}/download`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(this.redactPayload(opts)),
-    });
+    }, signal);
     const arrayBuf = await res.arrayBuffer();
     return Buffer.from(arrayBuf);
   }
