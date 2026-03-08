@@ -119,6 +119,27 @@ function buildRedactOpts(params: {
   };
 }
 
+// Helper: convert human-friendly durations (1h, 30m, 7d) to .NET TimeSpan format (d.HH:mm:ss)
+function toTimeSpan(input: string): string {
+  // Already in TimeSpan format (contains colons)
+  if (input.includes(":")) return input;
+  const match = input.match(/^(\d+)\s*(s|m|h|d)$/i);
+  if (!match) return input;
+  const value = parseInt(match[1], 10);
+  const unit = match[2].toLowerCase();
+  let totalSeconds = 0;
+  if (unit === "s") totalSeconds = value;
+  else if (unit === "m") totalSeconds = value * 60;
+  else if (unit === "h") totalSeconds = value * 3600;
+  else if (unit === "d") totalSeconds = value * 86400;
+  const days = Math.floor(totalSeconds / 86400);
+  const hours = Math.floor((totalSeconds % 86400) / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  const hms = `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  return days > 0 ? `${days}.${hms}` : hms;
+}
+
 // Helper: poll for file processing completion then download
 async function pollAndDownload(jobId: string, opts: RedactOptions, signal?: AbortSignal, maxAttempts = 30): Promise<Buffer> {
   for (let i = 0; i < maxAttempts; i++) {
@@ -126,9 +147,8 @@ async function pollAndDownload(jobId: string, opts: RedactOptions, signal?: Abor
     try {
       return await client.downloadRedactedFile(jobId, opts, signal);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      // 409 means still processing
-      if (msg.includes("409")) {
+      // 409 means still processing — retry after delay
+      if ((err as any)?.statusCode === 409) {
         logger.info("poll_retry", { jobId, attempt: i + 1, maxAttempts });
         await new Promise((r) => setTimeout(r, 2000));
         continue;
@@ -292,9 +312,9 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
   s.tool(
     "list_file_jobs",
     "List all unattached file redaction jobs and their statuses. Optionally filter to jobs from a recent time window (e.g. '1h', '30m', '7d').",
-    { from: z.string().optional().describe("Time window to look back, e.g. '1h', '30m', '7d'. If omitted, returns all jobs.") },
+    { from: z.string().optional().describe("Time window to look back, e.g. '1h', '30m', '7d'. Converted to TimeSpan format automatically. If omitted, returns all jobs.") },
     withLogging(logger, "list_file_jobs", async ({ from }) => {
-      const jobs = await client.listFileJobs(from);
+      const jobs = await client.listFileJobs(from ? toTimeSpan(from) : undefined);
       return { content: [{ type: "text" as const, text: JSON.stringify(jobs, null, 2) }] };
     })
   );
@@ -307,6 +327,26 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
     withLogging(logger, "get_file_job", async ({ jobId }) => {
       const job = await client.getFileJob(jobId);
       return { content: [{ type: "text" as const, text: JSON.stringify(job, null, 2) }] };
+    })
+  );
+
+  // --- download_redacted_file ---
+  s.tool(
+    "download_redacted_file",
+    "Download the redacted version of an unattached file job that has already been uploaded and processed. Use get_file_job or list_file_jobs to find the job ID. Only works for jobs with Completed status.",
+    {
+      jobId: z.string().describe("The job ID of a completed file redaction job"),
+      outputPath: z.string().describe("Absolute path where the redacted file should be saved"),
+      ...redactOptionSchemas,
+    },
+    withLogging(logger, "download_redacted_file", async (params, extra) => {
+      const signal: AbortSignal | undefined = extra?.signal;
+      const opts = buildRedactOpts(params);
+      const buffer = await client.downloadRedactedFile(params.jobId, opts, signal);
+      const dir = path.dirname(params.outputPath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(params.outputPath, buffer);
+      return { content: [{ type: "text" as const, text: `Redacted file saved to: ${params.outputPath} (${buffer.length} bytes)` }] };
     })
   );
 
@@ -738,7 +778,21 @@ async function main() {
           return;
         }
 
-        // Invalid/stale session or wrong method for no-session request
+        // Stale session ID on POST — client's session expired, create a new one
+        if (req.method === "POST" && sessionId) {
+          logger.info("session_expired_reconnect", { expiredSessionId: sessionId });
+          if (currentSession) {
+            await currentSession.server.close();
+          }
+          const session = createSession();
+          await session.server.connect(session.transport);
+          currentSession = session;
+          await session.transport.handleRequest(req, res);
+          logger.info("session_established", { sessionId: session.transport.sessionId });
+          return;
+        }
+
+        // GET/DELETE with unknown session — nothing to reconnect to
         logger.info("session_not_found", { method: req.method, sessionId: sessionId || null, currentSessionId: currentSession?.transport.sessionId || null });
         res.writeHead(404, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32001, message: "Session not found" }, id: null }));
