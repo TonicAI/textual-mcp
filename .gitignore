@@ -5,3 +5,4 @@ logs/
 claude-mcp-config.json
 *.tgz
 .DS_Store
+.idea/

@@ -45,6 +45,12 @@ export interface Dataset {
   generatorDefault?: string;
 }
 
+export interface DatasetUploadResponse {
+  updatedDataset: Dataset;
+  uploadedFileId?: string;
+  uploadedFile?: DatasetFile;
+}
+
 export interface FileRedactionJob {
   jobId: string;
   fileName: string;
@@ -346,19 +352,34 @@ export class TextualClient {
     });
   }
 
-  async uploadFileToDataset(datasetId: string, filePath: string): Promise<DatasetFile> {
+  async uploadFileToDataset(datasetId: string, filePath: string): Promise<DatasetUploadResponse> {
     const fileName = path.basename(filePath);
     const fileBuffer = fs.readFileSync(filePath);
     const mimeType = lookup(filePath) || "application/octet-stream";
 
     const formData = new FormData();
+    formData.append(
+      "document",
+      new Blob(
+        [JSON.stringify({
+          fileName,
+          csvConfig: {},
+          datasetId,
+          customPiiEntityIds: [],
+        })],
+        { type: "application/json" }
+      )
+    );
     formData.append("file", new Blob([fileBuffer], { type: mimeType }), fileName);
 
     const res = await this.request(`/api/Dataset/${datasetId}/files/upload`, {
       method: "POST",
       body: formData,
     });
-    return res.json() as Promise<DatasetFile>;
+    const data = await res.json() as DatasetUploadResponse;
+    const uploadedFile = data.updatedDataset.files.find((file) => file.fileId === data.uploadedFileId)
+      ?? data.updatedDataset.files.find((file) => file.fileName === fileName);
+    return { ...data, uploadedFile };
   }
 
   async downloadDatasetFile(
