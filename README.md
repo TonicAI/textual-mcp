@@ -38,46 +38,52 @@ The server is configured via environment variables:
 
 ## Running the server
 
+`TONIC_TEXTUAL_API_KEY` is **required**. For a self-hosted Textual instance, also set `TONIC_TEXTUAL_BASE_URL`.
+
 ### Global install
 
 ```bash
+# Tonic Textual cloud
 TONIC_TEXTUAL_API_KEY=your-key textual-mcp
+
+# Self-hosted instance
+TONIC_TEXTUAL_API_KEY=your-key TONIC_TEXTUAL_BASE_URL=https://your-instance.example.com textual-mcp
 ```
 
 ### From source
 
 ```bash
+# Tonic Textual cloud
 TONIC_TEXTUAL_API_KEY=your-key npm start
+
+# Self-hosted instance
+TONIC_TEXTUAL_API_KEY=your-key TONIC_TEXTUAL_BASE_URL=https://your-instance.example.com npm start
 ```
 
 The server starts on `http://localhost:3000/mcp` by default. A health check endpoint is available at `http://localhost:3000/health`.
 
 ## Adding to Claude
 
+> **Note:** You must start the MCP server before adding it to your Claude client. See [Running the server](#running-the-server) above.
+
 ### Claude Code
 
-```bash
-claude mcp add textual-mcp -- env TONIC_TEXTUAL_API_KEY=your-key textual-mcp
-```
-
-Or for a self-hosted instance:
+With the server running, register it as an HTTP transport:
 
 ```bash
-claude mcp add textual-mcp -- env TONIC_TEXTUAL_API_KEY=your-key TONIC_TEXTUAL_BASE_URL=https://your-instance.example.com textual-mcp
+claude mcp add --transport http textual-mcp http://localhost:3000/mcp
 ```
 
 ### Claude Desktop
 
-Add to your Claude Desktop config file (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
+With the server running, add the following to your Claude Desktop config file (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
 
 ```json
 {
   "mcpServers": {
     "textual-mcp": {
-      "command": "textual-mcp",
-      "env": {
-        "TONIC_TEXTUAL_API_KEY": "your-key"
-      }
+      "type": "http",
+      "url": "http://localhost:3000/mcp"
     }
   }
 }
