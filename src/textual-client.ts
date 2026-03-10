@@ -45,6 +45,12 @@ export interface Dataset {
   generatorDefault?: string;
 }
 
+export interface DatasetUploadResponse {
+  updatedDataset: Dataset;
+  uploadedFileId?: string;
+  uploadedFile?: DatasetFile;
+}
+
 export interface FileRedactionJob {
   jobId: string;
   fileName: string;
@@ -346,19 +352,51 @@ export class TextualClient {
     });
   }
 
-  async uploadFileToDataset(datasetId: string, filePath: string): Promise<DatasetFile> {
+  async uploadFileToDataset(datasetId: string, filePath: string): Promise<DatasetUploadResponse> {
     const fileName = path.basename(filePath);
     const fileBuffer = fs.readFileSync(filePath);
     const mimeType = lookup(filePath) || "application/octet-stream";
 
     const formData = new FormData();
+    formData.append(
+      "document",
+      new Blob(
+        [JSON.stringify({
+          fileName,
+          csvConfig: {},
+          datasetId,
+          customPiiEntityIds: [],
+        })],
+        { type: "application/json" }
+      )
+    );
     formData.append("file", new Blob([fileBuffer], { type: mimeType }), fileName);
 
     const res = await this.request(`/api/Dataset/${datasetId}/files/upload`, {
       method: "POST",
       body: formData,
     });
-    return res.json() as Promise<DatasetFile>;
+    const data: unknown = await res.json();
+    const updatedDataset =
+      typeof data === "object" && data !== null && "updatedDataset" in data
+        ? (data as { updatedDataset?: unknown }).updatedDataset
+        : undefined;
+
+    if (
+      typeof updatedDataset !== "object"
+      || updatedDataset === null
+      || !("files" in updatedDataset)
+      || !Array.isArray((updatedDataset as { files?: unknown }).files)
+    ) {
+      throw new Error(
+        "Invalid response from dataset file upload: expected updatedDataset.files array."
+      );
+    }
+
+    const validatedData = data as DatasetUploadResponse;
+    const uploadedFile = validatedData.updatedDataset.files.find((file) => file.fileId === validatedData.uploadedFileId)
+      ?? validatedData.updatedDataset.files.find((file) => file.fileName === fileName);
+    return { ...validatedData, uploadedFile };
   }
 
   async downloadDatasetFile(

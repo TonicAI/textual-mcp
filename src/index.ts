@@ -456,11 +456,17 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
       if (!fs.existsSync(filePath)) {
         return { content: [{ type: "text" as const, text: `Error: File not found: ${filePath}` }], isError: true };
       }
-      const file = await client.uploadFileToDataset(datasetId, filePath);
+      const upload = await client.uploadFileToDataset(datasetId, filePath);
+      const file = upload.uploadedFile;
       return {
         content: [{
           type: "text" as const,
-          text: JSON.stringify({ fileId: file.fileId, fileName: file.fileName, status: file.processingStatus, message: "File uploaded to dataset. Textual will scan it for PII." }, null, 2),
+          text: JSON.stringify({
+            fileId: upload.uploadedFileId ?? file?.fileId ?? null,
+            fileName: file?.fileName ?? path.basename(filePath),
+            status: file?.processingStatus ?? null,
+            message: "File uploaded to dataset. Textual will scan it for PII.",
+          }, null, 2),
         }],
       };
     })
