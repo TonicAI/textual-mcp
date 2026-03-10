@@ -376,10 +376,27 @@ export class TextualClient {
       method: "POST",
       body: formData,
     });
-    const data = await res.json() as DatasetUploadResponse;
-    const uploadedFile = data.updatedDataset.files.find((file) => file.fileId === data.uploadedFileId)
-      ?? data.updatedDataset.files.find((file) => file.fileName === fileName);
-    return { ...data, uploadedFile };
+    const data: unknown = await res.json();
+    const updatedDataset =
+      typeof data === "object" && data !== null && "updatedDataset" in data
+        ? (data as { updatedDataset?: unknown }).updatedDataset
+        : undefined;
+
+    if (
+      typeof updatedDataset !== "object"
+      || updatedDataset === null
+      || !("files" in updatedDataset)
+      || !Array.isArray((updatedDataset as { files?: unknown }).files)
+    ) {
+      throw new Error(
+        "Invalid response from dataset file upload: expected updatedDataset.files array."
+      );
+    }
+
+    const validatedData = data as DatasetUploadResponse;
+    const uploadedFile = validatedData.updatedDataset.files.find((file) => file.fileId === validatedData.uploadedFileId)
+      ?? validatedData.updatedDataset.files.find((file) => file.fileName === fileName);
+    return { ...validatedData, uploadedFile };
   }
 
   async downloadDatasetFile(
