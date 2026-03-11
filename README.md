@@ -33,48 +33,64 @@ The server is configured via environment variables:
 |---|---|---|---|
 | `TONIC_TEXTUAL_API_KEY` | Yes | — | Your Tonic Textual API key |
 | `TONIC_TEXTUAL_BASE_URL` | No | `https://textual.tonic.ai` | Base URL of your Textual instance |
-| `PORT` | No | `3000` | HTTP port for the MCP server |
+| `TONIC_TEXTUAL_TRANSPORT` | No | `http` | Transport mode: `http` or `stdio` |
+| `PORT` | No | `3000` | HTTP port (ignored in stdio mode) |
 | `TONIC_TEXTUAL_MAX_CONCURRENT_REQUESTS` | No | `50` | Max concurrent requests to the Textual API |
 
 ## Running the server
 
 `TONIC_TEXTUAL_API_KEY` is **required**. For a self-hosted Textual instance, also set `TONIC_TEXTUAL_BASE_URL`.
 
-### Global install
+The server supports two transport modes selected via `--transport` (or the `TONIC_TEXTUAL_TRANSPORT` env var):
+
+- **`http`** (default) — starts an HTTP server; clients connect via URL
+- **`stdio`** — reads/writes MCP JSON-RPC on stdin/stdout; the client manages the process lifecycle
+
+### HTTP mode
 
 ```bash
-# Tonic Textual cloud
+# Global install
 TONIC_TEXTUAL_API_KEY=your-key textual-mcp
 
 # Self-hosted instance
 TONIC_TEXTUAL_API_KEY=your-key TONIC_TEXTUAL_BASE_URL=https://your-instance.example.com textual-mcp
-```
 
-### From source
-
-```bash
-# Tonic Textual cloud
+# From source
 TONIC_TEXTUAL_API_KEY=your-key npm start
-
-# Self-hosted instance
-TONIC_TEXTUAL_API_KEY=your-key TONIC_TEXTUAL_BASE_URL=https://your-instance.example.com npm start
 ```
 
 The server starts on `http://localhost:3000/mcp` by default. A health check endpoint is available at `http://localhost:3000/health`.
 
-## Adding to Claude
-
-> **Note:** You must start the MCP server before adding it to your Claude client. See [Running the server](#running-the-server) above.
-
-### Claude Code
-
-With the server running, register it as an HTTP transport:
+### stdio mode
 
 ```bash
+# Global install
+TONIC_TEXTUAL_API_KEY=your-key textual-mcp --transport stdio
+
+# From source
+TONIC_TEXTUAL_API_KEY=your-key node dist/index.js --transport stdio
+```
+
+In stdio mode logs are written to `stderr` (and the log file) so they don't interfere with the MCP wire protocol on `stdout`.
+
+## Adding to Claude
+
+### Claude Code — HTTP transport
+
+Start the server first, then register it:
+
+```bash
+TONIC_TEXTUAL_API_KEY=your-key textual-mcp
 claude mcp add --transport http textual-mcp http://localhost:3000/mcp
 ```
 
-### Claude Desktop
+### Claude Code — stdio transport
+
+```bash
+claude mcp add --transport stdio textual-mcp -- textual-mcp --transport stdio --api-key your-key
+```
+
+### Claude Desktop — HTTP transport
 
 With the server running, add the following to your Claude Desktop config file (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
 
@@ -88,6 +104,23 @@ With the server running, add the following to your Claude Desktop config file (`
   }
 }
 ```
+
+### Claude Desktop — stdio transport
+
+Claude Desktop will start and manage the process automatically. No need to run the server separately:
+
+```json
+{
+  "mcpServers": {
+    "textual-mcp": {
+      "command": "textual-mcp",
+      "args": ["--transport", "stdio", "--api-key", "your-key"]
+    }
+  }
+}
+```
+
+For a self-hosted Textual instance, add `"--base-url", "https://your-instance.example.com"` to `args`.
 
 ## Available tools
 

@@ -4,6 +4,7 @@ import yargs from "yargs";
 import { hideBin } from "yargs/helpers";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { InMemoryTaskStore } from "@modelcontextprotocol/sdk/experimental/tasks";
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
@@ -31,8 +32,8 @@ const argv = yargs(hideBin(process.argv))
   })
   .option("api-key", {
     type: "string",
-    description: "Tonic Textual API key",
-    default: process.env.TONIC_TEXTUAL_API_KEY ?? "",
+    description: "Tonic Textual API key (or set TONIC_TEXTUAL_API_KEY)",
+    default: process.env.TONIC_TEXTUAL_API_KEY,
     demandOption: true,
   })
   .option("max-concurrent-requests", {
@@ -55,12 +56,22 @@ const argv = yargs(hideBin(process.argv))
     description: "Directory to write log files to",
     default: process.env.TONIC_TEXTUAL_LOG_DIR || "./logs",
   })
+  .option("transport", {
+    type: "string",
+    description: "Transport mode: 'http' or 'stdio'",
+    choices: ["http", "stdio"] as const,
+    default: (process.env.TONIC_TEXTUAL_TRANSPORT || "http") as "http" | "stdio",
+  })
+  .wrap(Math.min(120, yargs(hideBin(process.argv)).terminalWidth()))
   .parseSync();
 
 const BASE_URL: string = argv["base-url"];
 const API_KEY = argv["api-key"];
 
-const logger = new Logger(argv["log-dir"]);
+const logger = new Logger(
+  argv["log-dir"],
+  argv["transport"] === "stdio" ? process.stderr : process.stdout
+);
 const MAX_CONCURRENT = argv["max-concurrent-requests"];
 const POLL_INTERVAL_MS = 5000;
 const POLL_TIMEOUT_S = argv["poll-timeout-seconds"];
@@ -814,7 +825,24 @@ Recommended workflow: use scan_directory to preview, test redact_text/redact_jso
 // ============================================================
 // Start the server
 // ============================================================
-async function main() {
+
+async function runStdio() {
+  const server = new McpServer(
+    { name: "tonic-textual", version: "1.0.0" },
+    { taskStore: new InMemoryTaskStore() }
+  );
+  registerTools(server);
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  logger.info("Tonic Textual MCP server running on stdio");
+
+  process.stdin.on("close", () => {
+    logger.info("stdin closed, shutting down");
+    server.close().finally(() => process.exit(0));
+  });
+}
+
+async function runHttp() {
   const port = argv["port"];
 
   // Each session gets its own McpServer + Transport pair so that
@@ -904,6 +932,18 @@ async function main() {
   httpServer.listen(port, () => {
     logger.info("Tonic Textual MCP server running on HTTP", { port, endpoint: "/mcp" });
   });
+}
+
+async function main() {
+  switch (argv["transport"]) {
+    case "stdio":
+      await runStdio();
+      break;
+    case "http":
+    default:
+      await runHttp();
+      break;
+  }
 }
 
 process.on("uncaughtException", (err) => {
