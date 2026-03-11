@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import yargs from "yargs";
+import { hideBin } from "yargs/helpers";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { InMemoryTaskStore } from "@modelcontextprotocol/sdk/experimental/tasks";
@@ -21,18 +23,47 @@ import {
 } from "./textual-client.js";
 import { Logger, withLogging } from "./logger.js";
 
-const BASE_URL = process.env.TONIC_TEXTUAL_BASE_URL || "https://textual.tonic.ai";
-const API_KEY = process.env.TONIC_TEXTUAL_API_KEY;
+const argv = yargs(hideBin(process.argv))
+  .option("base-url", {
+    type: "string",
+    description: "Tonic Textual base URL",
+    default: process.env.TONIC_TEXTUAL_BASE_URL || "https://textual.tonic.ai",
+  })
+  .option("api-key", {
+    type: "string",
+    description: "Tonic Textual API key",
+    default: process.env.TONIC_TEXTUAL_API_KEY ?? "",
+    demandOption: true,
+  })
+  .option("max-concurrent-requests", {
+    type: "number",
+    description: "Maximum number of concurrent requests",
+    default: parseInt(process.env.TONIC_TEXTUAL_MAX_CONCURRENT_REQUESTS || "50", 10),
+  })
+  .option("poll-timeout-seconds", {
+    type: "number",
+    description: "Timeout in seconds when polling for file processing completion",
+    default: parseInt(process.env.TONIC_TEXTUAL_POLL_TIMEOUT_SECONDS || "900", 10),
+  })
+  .option("port", {
+    type: "number",
+    description: "Port to listen on",
+    default: parseInt(process.env.PORT || "3000", 10),
+  })
+  .option("log-dir", {
+    type: "string",
+    description: "Directory to write log files to",
+    default: process.env.TONIC_TEXTUAL_LOG_DIR || "./logs",
+  })
+  .parseSync();
 
-if (!API_KEY) {
-  console.error("TONIC_TEXTUAL_API_KEY environment variable is required");
-  process.exit(1);
-}
+const BASE_URL: string = argv["base-url"];
+const API_KEY = argv["api-key"];
 
-const logger = new Logger();
-const MAX_CONCURRENT = parseInt(process.env.TONIC_TEXTUAL_MAX_CONCURRENT_REQUESTS || "50", 10);
+const logger = new Logger(argv["log-dir"]);
+const MAX_CONCURRENT = argv["max-concurrent-requests"];
 const POLL_INTERVAL_MS = 5000;
-const POLL_TIMEOUT_S = parseInt(process.env.TONIC_TEXTUAL_POLL_TIMEOUT_SECONDS || "900", 10);
+const POLL_TIMEOUT_S = argv["poll-timeout-seconds"];
 const client = new TextualClient(BASE_URL, API_KEY, logger, MAX_CONCURRENT);
 
 // --- Shared schemas ---
@@ -784,7 +815,7 @@ Recommended workflow: use scan_directory to preview, test redact_text/redact_jso
 // Start the server
 // ============================================================
 async function main() {
-  const port = parseInt(process.env.PORT || "3000", 10);
+  const port = argv["port"];
 
   // Each session gets its own McpServer + Transport pair so that
   // in-flight request state, abort controllers, and response handlers

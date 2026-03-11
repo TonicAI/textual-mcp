@@ -37,11 +37,13 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
-    "mime-types": "^2.1.35"
+    "mime-types": "^2.1.35",
+    "yargs": "^17.7.2"
   },
   "devDependencies": {
     "@types/mime-types": "^2.1.4",
     "@types/node": "^22.0.0",
+    "@types/yargs": "^17.0.35",
     "typescript": "^5.7.0"
   }
 }
