@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
-import yargs from "yargs";
-import { hideBin } from "yargs/helpers";
+import { Command, Option } from "commander";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -24,57 +23,40 @@ import {
 } from "./textual-client.js";
 import { Logger, withLogging } from "./logger.js";
 
-const argv = yargs(hideBin(process.argv))
-  .option("base-url", {
-    type: "string",
-    description: "Tonic Textual base URL",
-    default: process.env.TONIC_TEXTUAL_BASE_URL || "https://textual.tonic.ai",
-  })
-  .option("api-key", {
-    type: "string",
-    description: "Tonic Textual API key (or set TONIC_TEXTUAL_API_KEY)",
-    default: process.env.TONIC_TEXTUAL_API_KEY,
-    demandOption: true,
-  })
-  .option("max-concurrent-requests", {
-    type: "number",
-    description: "Maximum number of concurrent requests",
-    default: parseInt(process.env.TONIC_TEXTUAL_MAX_CONCURRENT_REQUESTS || "50", 10),
-  })
-  .option("poll-timeout-seconds", {
-    type: "number",
-    description: "Timeout in seconds when polling for file processing completion",
-    default: parseInt(process.env.TONIC_TEXTUAL_POLL_TIMEOUT_SECONDS || "900", 10),
-  })
-  .option("port", {
-    type: "number",
-    description: "Port to listen on",
-    default: parseInt(process.env.PORT || "3000", 10),
-  })
-  .option("log-dir", {
-    type: "string",
-    description: "Directory to write log files to",
-    default: process.env.TONIC_TEXTUAL_LOG_DIR || "./logs",
-  })
-  .option("transport", {
-    type: "string",
-    description: "Transport mode: 'http' or 'stdio'",
-    choices: ["http", "stdio"] as const,
-    default: (process.env.TONIC_TEXTUAL_TRANSPORT || "http") as "http" | "stdio",
-  })
-  .wrap(Math.min(120, yargs(hideBin(process.argv)).terminalWidth()))
-  .parseSync();
+const toInt = (s: string) => parseInt(s, 10);
 
-const BASE_URL: string = argv["base-url"];
-const API_KEY = argv["api-key"];
+const program = new Command()
+  .name("textual-mcp")
+  .description("Tonic Textual MCP server — PII detection and de-identification for AI assistants")
+  .addOption(new Option("--base-url <url>", "Tonic Textual base URL").default("https://textual.tonic.ai").env("TONIC_TEXTUAL_BASE_URL"))
+  .addOption(new Option("--api-key <key>", "Tonic Textual API key").env("TONIC_TEXTUAL_API_KEY").makeOptionMandatory())
+  .addOption(new Option("--max-concurrent-requests <n>", "Maximum concurrent requests to the Textual API").argParser(toInt).default(50).env("TONIC_TEXTUAL_MAX_CONCURRENT_REQUESTS"))
+  .addOption(new Option("--poll-timeout-seconds <n>", "Timeout in seconds when polling for file processing completion").argParser(toInt).default(900).env("TONIC_TEXTUAL_POLL_TIMEOUT_SECONDS"))
+  .addOption(new Option("--port <n>", "HTTP port to listen on, ignored in stdio mode").argParser(toInt).default(3000).env("PORT"))
+  .addOption(new Option("--log-dir <dir>", "Directory to write log files to").default("./logs").env("TONIC_TEXTUAL_LOG_DIR"))
+  .addOption(new Option("--transport <mode>", "Transport mode: http or stdio").default("http").env("TONIC_TEXTUAL_TRANSPORT"))
+  .parse();
+
+const opts = program.opts<{
+  baseUrl: string;
+  apiKey: string;
+  maxConcurrentRequests: number;
+  pollTimeoutSeconds: number;
+  port: number;
+  logDir: string;
+  transport: string;
+}>();
+
+const BASE_URL: string = opts.baseUrl;
+const API_KEY = opts.apiKey;
 
 const logger = new Logger(
-  argv["log-dir"],
-  argv["transport"] === "stdio" ? process.stderr : process.stdout
+  opts.logDir,
+  opts.transport === "stdio" ? process.stderr : process.stdout
 );
-const MAX_CONCURRENT = argv["max-concurrent-requests"];
+const MAX_CONCURRENT = opts.maxConcurrentRequests;
 const POLL_INTERVAL_MS = 5000;
-const POLL_TIMEOUT_S = argv["poll-timeout-seconds"];
+const POLL_TIMEOUT_S = opts.pollTimeoutSeconds;
 const client = new TextualClient(BASE_URL, API_KEY, logger, MAX_CONCURRENT);
 
 // --- Shared schemas ---
@@ -843,7 +825,7 @@ async function runStdio() {
 }
 
 async function runHttp() {
-  const port = argv["port"];
+  const port = opts.port;
 
   // Each session gets its own McpServer + Transport pair so that
   // in-flight request state, abort controllers, and response handlers
@@ -935,7 +917,7 @@ async function runHttp() {
 }
 
 async function main() {
-  switch (argv["transport"]) {
+  switch (opts.transport) {
     case "stdio":
       await runStdio();
       break;
