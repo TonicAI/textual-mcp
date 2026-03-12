@@ -27,7 +27,7 @@ npm run build
 
 ## Configuration
 
-The server is configured via environment variables:
+All options are configured via environment variables.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
@@ -37,14 +37,16 @@ The server is configured via environment variables:
 | `PORT` | No | `3000` | HTTP port (ignored in stdio mode) |
 | `TONIC_TEXTUAL_MAX_CONCURRENT_REQUESTS` | No | `50` | Max concurrent requests to the Textual API |
 
+Run `textual-mcp --help` to print all options with their descriptions and defaults.
+
 ## Running the server
 
 `TONIC_TEXTUAL_API_KEY` is **required**. For a self-hosted Textual instance, also set `TONIC_TEXTUAL_BASE_URL`.
 
-The server supports two transport modes selected via `--transport` (or the `TONIC_TEXTUAL_TRANSPORT` env var):
+The server supports two transport modes controlled by `TONIC_TEXTUAL_TRANSPORT`:
 
-- **`http`** (default) — starts an HTTP server; clients connect via URL
-- **`stdio`** — reads/writes MCP JSON-RPC on stdin/stdout; the client manages the process lifecycle
+- [**`http`**](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http) (default) — starts an HTTP server; clients connect via URL
+- [**`stdio`**](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#stdio) — reads/writes MCP JSON-RPC on stdin/stdout; the client manages the process lifecycle
 
 ### HTTP mode
 
@@ -54,9 +56,6 @@ TONIC_TEXTUAL_API_KEY=your-key textual-mcp
 
 # Self-hosted instance
 TONIC_TEXTUAL_API_KEY=your-key TONIC_TEXTUAL_BASE_URL=https://your-instance.example.com textual-mcp
-
-# From source
-TONIC_TEXTUAL_API_KEY=your-key npm start
 ```
 
 The server starts on `http://localhost:3000/mcp` by default. A health check endpoint is available at `http://localhost:3000/health`.
@@ -64,63 +63,40 @@ The server starts on `http://localhost:3000/mcp` by default. A health check endp
 ### stdio mode
 
 ```bash
-# Global install
-TONIC_TEXTUAL_API_KEY=your-key textual-mcp --transport stdio
-
-# From source
-TONIC_TEXTUAL_API_KEY=your-key node dist/index.js --transport stdio
+TONIC_TEXTUAL_API_KEY=your-key TONIC_TEXTUAL_TRANSPORT=stdio textual-mcp
 ```
 
 In stdio mode logs are written to `stderr` (and the log file) so they don't interfere with the MCP wire protocol on `stdout`.
 
 ## Adding to Claude
 
-### Claude Code — HTTP transport
+Both Claude Code and Claude Desktop use **stdio transport**, where the client starts and manages the server process automatically.
 
-Start the server first, then register it:
-
-```bash
-TONIC_TEXTUAL_API_KEY=your-key textual-mcp
-claude mcp add --transport http textual-mcp http://localhost:3000/mcp
-```
-
-### Claude Code — stdio transport
+### Claude Code
 
 ```bash
-claude mcp add --transport stdio textual-mcp -- textual-mcp --transport stdio --api-key your-key
+claude mcp add --transport stdio textual-mcp -- env TONIC_TEXTUAL_API_KEY=your-key TONIC_TEXTUAL_TRANSPORT=stdio textual-mcp
 ```
 
-### Claude Desktop — HTTP transport
+### Claude Desktop
 
-With the server running, add the following to your Claude Desktop config file (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
-
-```json
-{
-  "mcpServers": {
-    "textual-mcp": {
-      "type": "http",
-      "url": "http://localhost:3000/mcp"
-    }
-  }
-}
-```
-
-### Claude Desktop — stdio transport
-
-Claude Desktop will start and manage the process automatically. No need to run the server separately:
+Add the following to your Claude Desktop config file (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
 
 ```json
 {
   "mcpServers": {
     "textual-mcp": {
       "command": "textual-mcp",
-      "args": ["--transport", "stdio", "--api-key", "your-key"]
+      "env": {
+        "TONIC_TEXTUAL_API_KEY": "your-key",
+        "TONIC_TEXTUAL_TRANSPORT": "stdio"
+      }
     }
   }
 }
 ```
 
-For a self-hosted Textual instance, add `"--base-url", "https://your-instance.example.com"` to `args`.
+For a self-hosted Textual instance, add `"TONIC_TEXTUAL_BASE_URL": "https://your-instance.example.com"` to `env`.
 
 ## Available tools
 

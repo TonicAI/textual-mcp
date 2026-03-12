@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import { Command, Option } from "commander";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -23,40 +22,103 @@ import {
 } from "./textual-client.js";
 import { Logger, withLogging } from "./logger.js";
 
-const toInt = (s: string) => parseInt(s, 10);
+// ---------------------------------------------------------------------------
+// Environment variable configuration schema
+// ---------------------------------------------------------------------------
 
-const program = new Command()
-  .name("textual-mcp")
-  .description("Tonic Textual MCP server — PII detection and de-identification for AI assistants")
-  .addOption(new Option("--base-url <url>", "Tonic Textual base URL").default("https://textual.tonic.ai").env("TONIC_TEXTUAL_BASE_URL"))
-  .addOption(new Option("--api-key <key>", "Tonic Textual API key").env("TONIC_TEXTUAL_API_KEY").makeOptionMandatory())
-  .addOption(new Option("--max-concurrent-requests <n>", "Maximum concurrent requests to the Textual API").argParser(toInt).default(50).env("TONIC_TEXTUAL_MAX_CONCURRENT_REQUESTS"))
-  .addOption(new Option("--poll-timeout-seconds <n>", "Timeout in seconds when polling for file processing completion").argParser(toInt).default(900).env("TONIC_TEXTUAL_POLL_TIMEOUT_SECONDS"))
-  .addOption(new Option("--port <n>", "HTTP port to listen on, ignored in stdio mode").argParser(toInt).default(3000).env("PORT"))
-  .addOption(new Option("--log-dir <dir>", "Directory to write log files to").default("./logs").env("TONIC_TEXTUAL_LOG_DIR"))
-  .addOption(new Option("--transport <mode>", "Transport mode: http or stdio").default("http").env("TONIC_TEXTUAL_TRANSPORT"))
-  .parse();
+const envSchema = z.object({
+  TONIC_TEXTUAL_API_KEY: z
+    .string()
+    .min(1)
+    .describe("(required) Tonic Textual API key"),
+  TONIC_TEXTUAL_BASE_URL: z
+    .string()
+    .url()
+    .default("https://textual.tonic.ai")
+    .describe("(optional) Tonic Textual base URL [default: https://textual.tonic.ai]"),
+  TONIC_TEXTUAL_TRANSPORT: z
+    .enum(["http", "stdio"])
+    .default("http")
+    .describe("(optional) Transport mode: http or stdio [default: http]"),
+  PORT: z
+    .string()
+    .regex(/^\d+$/, "Must be a positive integer")
+    .default("3000")
+    .transform(Number)
+    .describe("(optional) HTTP port to listen on, ignored in stdio mode [default: 3000]"),
+  TONIC_TEXTUAL_MAX_CONCURRENT_REQUESTS: z
+    .string()
+    .regex(/^\d+$/, "Must be a positive integer")
+    .default("50")
+    .transform(Number)
+    .describe("(optional) Maximum concurrent requests to the Textual API [default: 50]"),
+  TONIC_TEXTUAL_POLL_TIMEOUT_SECONDS: z
+    .string()
+    .regex(/^\d+$/, "Must be a positive integer")
+    .default("900")
+    .transform(Number)
+    .describe("(optional) Timeout in seconds when polling for file processing completion [default: 900]"),
+  TONIC_TEXTUAL_LOG_DIR: z
+    .string()
+    .default("./logs")
+    .describe("(optional) Directory to write log files to [default: ./logs]"),
+});
 
-const opts = program.opts<{
-  baseUrl: string;
-  apiKey: string;
-  maxConcurrentRequests: number;
-  pollTimeoutSeconds: number;
-  port: number;
-  logDir: string;
-  transport: string;
-}>();
+/** Print a help table derived from the schema's field descriptions and exit. */
+function printEnvHelp(errors?: z.ZodError): never {
+  const shape = envSchema.shape;
+  const lines: string[] = [
+    "Tonic Textual MCP server — PII detection and de-identification for AI assistants",
+    "",
+    "Configuration is provided via environment variables:",
+    "",
+  ];
 
-const BASE_URL: string = opts.baseUrl;
-const API_KEY = opts.apiKey;
+  const nameWidth = Math.max(...Object.keys(shape).map((k) => k.length));
+  for (const [key, field] of Object.entries(shape)) {
+    const desc = field.description ?? "";
+    lines.push(`  ${key.padEnd(nameWidth)}  ${desc}`);
+  }
+
+  if (errors) {
+    lines.push("");
+    lines.push("Errors:");
+    for (const issue of errors.issues) {
+      const envVar = issue.path.join(".");
+      lines.push(`  ${envVar}: ${issue.message}`);
+    }
+  }
+
+  // Always write to stderr so it is visible even in stdio transport mode
+  process.stderr.write(lines.join("\n") + "\n");
+  process.exit(errors ? 1 : 0);
+}
+
+// Parse and validate env vars; exit with help on failure
+if (process.argv.includes("--help") || process.argv.includes("-h")) {
+  printEnvHelp();
+}
+
+const envResult = envSchema.safeParse(process.env);
+if (!envResult.success) {
+  printEnvHelp(envResult.error);
+}
+const env = envResult.data;
+
+// ---------------------------------------------------------------------------
+// Apply config
+// ---------------------------------------------------------------------------
+
+const BASE_URL: string = env.TONIC_TEXTUAL_BASE_URL;
+const API_KEY = env.TONIC_TEXTUAL_API_KEY;
 
 const logger = new Logger(
-  opts.logDir,
-  opts.transport === "stdio" ? process.stderr : process.stdout
+  env.TONIC_TEXTUAL_LOG_DIR,
+  env.TONIC_TEXTUAL_TRANSPORT === "stdio" ? process.stderr : process.stdout
 );
-const MAX_CONCURRENT = opts.maxConcurrentRequests;
+const MAX_CONCURRENT = env.TONIC_TEXTUAL_MAX_CONCURRENT_REQUESTS;
 const POLL_INTERVAL_MS = 5000;
-const POLL_TIMEOUT_S = opts.pollTimeoutSeconds;
+const POLL_TIMEOUT_S = env.TONIC_TEXTUAL_POLL_TIMEOUT_SECONDS;
 const client = new TextualClient(BASE_URL, API_KEY, logger, MAX_CONCURRENT);
 
 // --- Shared schemas ---
@@ -825,7 +887,7 @@ async function runStdio() {
 }
 
 async function runHttp() {
-  const port = opts.port;
+  const port = env.PORT;
 
   // Each session gets its own McpServer + Transport pair so that
   // in-flight request state, abort controllers, and response handlers
@@ -917,7 +979,7 @@ async function runHttp() {
 }
 
 async function main() {
-  switch (opts.transport) {
+  switch (env.TONIC_TEXTUAL_TRANSPORT) {
     case "stdio":
       await runStdio();
       break;

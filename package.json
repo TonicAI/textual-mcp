@@ -37,8 +37,8 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
-    "commander": "^13.1.0",
-    "mime-types": "^2.1.35"
+    "mime-types": "^2.1.35",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@types/mime-types": "^2.1.4",
