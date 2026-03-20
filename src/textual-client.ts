@@ -1,7 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { lookup } from "mime-types";
 import type { Logger } from "./logger.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const packageJson = JSON.parse(fs.readFileSync(path.resolve(__dirname, "..", "package.json"), "utf-8"));
+export const USER_AGENT = `textual-mcp/${packageJson.version} (+https://github.com/TonicAI/textual-mcp)`;
 
 export interface RedactionEntity {
   start: number;
@@ -435,6 +440,7 @@ export class TextualClient {
     const method = options.method || "GET";
     const headers: Record<string, string> = {
       Authorization: this.apiKey,
+      "User-Agent": USER_AGENT,
       ...((options.headers as Record<string, string>) || {}),
     };
     await this.semaphore.acquire();
