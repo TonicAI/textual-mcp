@@ -2,6 +2,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { InMemoryTaskStore } from "@modelcontextprotocol/sdk/experimental/tasks";
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
@@ -33,18 +34,103 @@ import {
 } from "./textual-client.js";
 import { Logger, withLogging } from "./logger.js";
 
-const BASE_URL = process.env.TONIC_TEXTUAL_BASE_URL || "https://textual.tonic.ai";
-const API_KEY = process.env.TONIC_TEXTUAL_API_KEY;
+// ---------------------------------------------------------------------------
+// Environment variable configuration schema
+// ---------------------------------------------------------------------------
 
-if (!API_KEY) {
-  console.error("TONIC_TEXTUAL_API_KEY environment variable is required");
-  process.exit(1);
+const envSchema = z.object({
+  TONIC_TEXTUAL_API_KEY: z
+    .string()
+    .min(1)
+    .describe("(required) Tonic Textual API key"),
+  TONIC_TEXTUAL_BASE_URL: z
+    .string()
+    .url()
+    .default("https://textual.tonic.ai")
+    .describe("(optional) Tonic Textual base URL [default: https://textual.tonic.ai]"),
+  TONIC_TEXTUAL_TRANSPORT: z
+    .enum(["http", "stdio"])
+    .default("http")
+    .describe("(optional) Transport mode: http or stdio [default: http]"),
+  PORT: z
+    .string()
+    .regex(/^\d+$/, "Must be a positive integer")
+    .default("3000")
+    .transform(Number)
+    .describe("(optional) HTTP port to listen on, ignored in stdio mode [default: 3000]"),
+  TONIC_TEXTUAL_MAX_CONCURRENT_REQUESTS: z
+    .string()
+    .regex(/^\d+$/, "Must be a positive integer")
+    .default("50")
+    .transform(Number)
+    .describe("(optional) Maximum concurrent requests to the Textual API [default: 50]"),
+  TONIC_TEXTUAL_POLL_TIMEOUT_SECONDS: z
+    .string()
+    .regex(/^\d+$/, "Must be a positive integer")
+    .default("900")
+    .transform(Number)
+    .describe("(optional) Timeout in seconds when polling for file processing completion [default: 900]"),
+  TONIC_TEXTUAL_LOG_DIR: z
+    .string()
+    .default("./logs")
+    .describe("(optional) Directory to write log files to [default: ./logs]"),
+});
+
+/** Print a help table derived from the schema's field descriptions and exit. */
+function printEnvHelp(errors?: z.ZodError): never {
+  const shape = envSchema.shape;
+  const lines: string[] = [
+    "Tonic Textual MCP server — PII detection and de-identification for AI assistants",
+    "",
+    "Configuration is provided via environment variables:",
+    "",
+  ];
+
+  const nameWidth = Math.max(...Object.keys(shape).map((k) => k.length));
+  for (const [key, field] of Object.entries(shape)) {
+    const desc = field.description ?? "";
+    lines.push(`  ${key.padEnd(nameWidth)}  ${desc}`);
+  }
+
+  if (errors) {
+    lines.push("");
+    lines.push("Errors:");
+    for (const issue of errors.issues) {
+      const envVar = issue.path.join(".");
+      lines.push(`  ${envVar}: ${issue.message}`);
+    }
+  }
+
+  // Always write to stderr so it is visible even in stdio transport mode
+  process.stderr.write(lines.join("\n") + "\n");
+  process.exit(errors ? 1 : 0);
 }
 
-const logger = new Logger();
-const MAX_CONCURRENT = parseInt(process.env.TONIC_TEXTUAL_MAX_CONCURRENT_REQUESTS || "50", 10);
+// Parse and validate env vars; exit with help on failure
+if (process.argv.includes("--help") || process.argv.includes("-h")) {
+  printEnvHelp();
+}
+
+const envResult = envSchema.safeParse(process.env);
+if (!envResult.success) {
+  printEnvHelp(envResult.error);
+}
+const env = envResult.data;
+
+// ---------------------------------------------------------------------------
+// Apply config
+// ---------------------------------------------------------------------------
+
+const BASE_URL: string = env.TONIC_TEXTUAL_BASE_URL;
+const API_KEY = env.TONIC_TEXTUAL_API_KEY;
+
+const logger = new Logger(
+  env.TONIC_TEXTUAL_LOG_DIR,
+  env.TONIC_TEXTUAL_TRANSPORT === "stdio" ? process.stderr : process.stdout
+);
+const MAX_CONCURRENT = env.TONIC_TEXTUAL_MAX_CONCURRENT_REQUESTS;
 const POLL_INTERVAL_MS = 5000;
-const POLL_TIMEOUT_S = parseInt(process.env.TONIC_TEXTUAL_POLL_TIMEOUT_SECONDS || "900", 10);
+const POLL_TIMEOUT_S = env.TONIC_TEXTUAL_POLL_TIMEOUT_SECONDS;
 const client = new TextualClient(BASE_URL, API_KEY, logger, MAX_CONCURRENT);
 
 // --- Shared schemas ---
@@ -1900,8 +1986,25 @@ Recommended workflow: use scan_directory to preview, test redact_text/redact_jso
 // ============================================================
 // Start the server
 // ============================================================
-async function main() {
-  const port = parseInt(process.env.PORT || "3000", 10);
+
+async function runStdio() {
+  const server = new McpServer(
+    { name: "tonic-textual", version: "1.0.0" },
+    { taskStore: new InMemoryTaskStore() }
+  );
+  registerTools(server);
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  logger.info("Tonic Textual MCP server running on stdio");
+
+  process.stdin.on("close", () => {
+    logger.info("stdin closed, shutting down");
+    server.close().finally(() => process.exit(0));
+  });
+}
+
+async function runHttp() {
+  const port = env.PORT;
 
   // Each session gets its own McpServer + Transport pair so that
   // in-flight request state, abort controllers, and response handlers
@@ -1990,6 +2093,18 @@ async function main() {
   httpServer.listen(port, () => {
     logger.info("Tonic Textual MCP server running on HTTP", { port, endpoint: "/mcp" });
   });
+}
+
+async function main() {
+  switch (env.TONIC_TEXTUAL_TRANSPORT) {
+    case "stdio":
+      await runStdio();
+      break;
+    case "http":
+    default:
+      await runHttp();
+      break;
+  }
 }
 
 process.on("uncaughtException", (err) => {

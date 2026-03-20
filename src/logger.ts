@@ -43,9 +43,9 @@ export class Logger {
   private currentFilePath: string = "";
   private currentSize: number = 0;
 
-  constructor(logDir?: string) {
+  constructor(logDir?: string, consoleStream?: NodeJS.WriteStream) {
     this.logDir = logDir || process.env.TONIC_TEXTUAL_LOG_DIR || "./logs";
-    this.consoleStream = process.stdout;
+    this.consoleStream = consoleStream ?? process.stdout;
     fs.mkdirSync(this.logDir, { recursive: true });
     this.openStream();
   }
