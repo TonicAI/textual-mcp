@@ -103,6 +103,276 @@ export interface JsonRedactOptions extends RedactOptions {
   jsonPathIgnorePaths?: string[];
 }
 
+export type ModelBasedEntityFileSource = "Local" | "S3" | "Azure" | "GoogleCloud";
+
+export type ModelBasedEntityStatus =
+  | "TestDataSetup"
+  | "GuidelinesRefinement"
+  | "PreTraining"
+  | "Training"
+  | "Ready";
+
+export type ModelBasedEntityVersionStatus =
+  | "Annotating"
+  | "QueuedForSuggestions"
+  | "GeneratingSuggestions"
+  | "Ready"
+  | "Failed";
+
+export type ModelBasedEntityTrainedModelStatus =
+  | "WaitingForFiles"
+  | "Annotating"
+  | "ReadyForTraining"
+  | "Training"
+  | "Ready"
+  | "Failed";
+
+export type ModelBasedEntityFileStatus =
+  | "QueuedForAnalysis"
+  | "Analyzing"
+  | "QueuedForAnnotation"
+  | "Annotating"
+  | "ReadyForReview"
+  | "ReviewInProgress"
+  | "Reviewed"
+  | "Failed";
+
+export type ModelBasedEntityFileVersionStatus =
+  | "Attached"
+  | "QueuedForAnnotation"
+  | "Annotating"
+  | "PendingReview"
+  | "Annotated"
+  | "Failed";
+
+export type ModelBasedEntityTrainingFileStatus =
+  | "QueuedForAnalysis"
+  | "Analyzing"
+  | "Ready"
+  | "Failed";
+
+export interface ModelBasedEntityAnnotationSpan {
+  start: number;
+  end: number;
+}
+
+export interface CreateModelBasedEntityRequest {
+  name: string;
+  guidelines: string;
+}
+
+export interface CreateEntityVersionRequest {
+  guidelines: string;
+}
+
+export interface UpdateModelBasedEntityRequest {
+  [key: string]: unknown;
+}
+
+export interface SaveEntityGroundTruthRequest {
+  annotations: ModelBasedEntityAnnotationSpan[];
+  markAsReviewed: boolean;
+}
+
+export interface CreateTrainedModelRequest {
+  versionId: string;
+}
+
+export interface ModelBasedEntityApiModel {
+  id: string;
+  name: string;
+  displayName: string;
+  fileSource: ModelBasedEntityFileSource;
+  status: ModelBasedEntityStatus;
+  activeModelId: string | null;
+  datasetIds: string[];
+  createdByUserId: string;
+  lastModifiedDate: string;
+}
+
+export interface ModelBasedEntityFileMinimalApiModel {
+  id: string;
+  deleted: boolean;
+  fileName: string;
+  filePath: string | null;
+  minimumVersionId: string;
+  status: ModelBasedEntityFileStatus;
+  errorType: string | null;
+  errorDetails: string | null;
+  createdAt: string;
+}
+
+export interface ModelBasedEntityFileFullApiModel extends ModelBasedEntityFileMinimalApiModel {
+  content: string;
+  groundTruth: ModelBasedEntityAnnotationSpan[];
+}
+
+export interface ModelBasedEntityFileVersionRecordWithAnnotations {
+  id: string;
+  fileId: string;
+  versionId: string;
+  deleted: boolean;
+  fileName: string;
+  filePath: string | null;
+  numEntities: number;
+  f1Score: number;
+  recallScore: number;
+  precisionScore: number;
+  status: ModelBasedEntityFileVersionStatus;
+  errorType: string | null;
+  errorDetails: string | null;
+  createdAt: string;
+  content: string;
+  annotations: ModelBasedEntityAnnotationSpan[];
+}
+
+export interface ModelBasedEntityVersionApiModel {
+  id: string;
+  entityId: string;
+  versionNumber: number;
+  guidelines: string;
+  entityCount: number;
+  f1Score: number;
+  recallScore: number;
+  precisionScore: number;
+  status: ModelBasedEntityVersionStatus;
+  errorType: string | null;
+  errorDetails: string | null;
+  files: ModelBasedEntityFileVersionRecordWithAnnotations[];
+}
+
+export interface ModelBasedEntitySuggestedGuidelinesApiModel {
+  guidelines: string;
+}
+
+export interface ModelBasedEntityTrainedModelApiModel {
+  id: string;
+  number: number;
+  entityId: string;
+  versionId: string;
+  isActive: boolean;
+  status: ModelBasedEntityTrainedModelStatus;
+  progress: number;
+  benchmarkScore: number;
+  entityCount: number;
+  fileCount: number;
+}
+
+export interface ModelBasedEntityModelTrainingFileApiModel {
+  id: string;
+  fileId: string;
+  fileName: string;
+  deleted: boolean;
+  createdAt: string;
+  numEntities?: number;
+  [key: string]: unknown;
+}
+
+export interface ModelBasedEntityModelTrainingFileFullApiModel extends ModelBasedEntityModelTrainingFileApiModel {
+  content: string;
+  annotations: ModelBasedEntityAnnotationSpan[];
+}
+
+export interface ModelBasedEntityDetectedEntityApiModel {
+  name: string;
+  count: number;
+  [key: string]: unknown;
+}
+
+export interface ModelBasedEntityTrainingFileApiModel {
+  id: string;
+  deleted: boolean;
+  entityId: string;
+  fileName: string;
+  filePath: string | null;
+  status: ModelBasedEntityTrainingFileStatus;
+  createdAt: string;
+}
+
+export interface ModelBasedEntityTrainingFileFullApiModel extends ModelBasedEntityTrainingFileApiModel {
+  content: string;
+}
+
+export interface ListEntityTrainingFilesOptions {
+  search?: string;
+  offset?: number;
+  limit?: number;
+}
+
+export interface ListAllModelBasedEntitiesOptions extends ListEntityTrainingFilesOptions {
+  users?: string[];
+  statuses?: string[];
+  sortBy?: string;
+  sortDirection?: string;
+}
+
+export interface ListModelTrainingFilesOptions extends ListEntityTrainingFilesOptions {}
+
+export interface ListModelDetectedEntitiesOptions extends ListEntityTrainingFilesOptions {}
+
+export interface PaginatedModelBasedEntityListResponse {
+  records: ModelBasedEntityApiModel[];
+  offset?: number;
+  limit?: number;
+  pageNumber?: number;
+  totalPages?: number;
+  totalRecords: number;
+  absoluteTotalRecords?: number;
+  hasPreviousPage?: boolean;
+  hasNextPage?: boolean;
+  search?: string;
+  users?: string[];
+  statuses?: string[];
+  sortBy?: string;
+  sortDirection?: string;
+}
+
+export interface ModelBasedEntityTrainingFileListResponse {
+  files: ModelBasedEntityTrainingFileApiModel[];
+  search?: string;
+  offset?: number;
+  limit?: number;
+  totalCount: number;
+}
+
+export interface ModelBasedEntityModelTrainingFileListResponse {
+  files: ModelBasedEntityModelTrainingFileApiModel[];
+  search?: string;
+  offset?: number;
+  limit?: number;
+  totalCount: number;
+  absoluteTotalCount?: number;
+  totalPages?: number;
+}
+
+export interface ModelBasedEntityDetectedEntityListResponse {
+  entities: ModelBasedEntityDetectedEntityApiModel[];
+  search?: string;
+  offset?: number;
+  limit?: number;
+  totalCount: number;
+}
+
+export interface StartModelTrainingResponse {
+  [key: string]: unknown;
+}
+
+export interface ActivateTrainedModelResponse {
+  [key: string]: unknown;
+}
+
+export interface ActivateEntityForDatasetResponse {
+  [key: string]: unknown;
+}
+
+export interface DeactivateEntityForDatasetResponse {
+  [key: string]: unknown;
+}
+
+export interface ModelBasedEntityActionResponse {
+  [key: string]: unknown;
+}
+
 class Semaphore {
   private queue: Array<() => void> = [];
   private active = 0;
@@ -217,6 +487,418 @@ export class TextualClient {
     return res.json() as Promise<T>;
   }
 
+  private async jsonOrNull<T>(res: Response): Promise<T | null> {
+    const text = await res.text();
+    if (!text.trim()) return null;
+    return JSON.parse(text) as T;
+  }
+
+  private getLocalFileForUpload(filePath: string): {
+    resolvedPath: string;
+    fileName: string;
+    fileBuffer: Buffer;
+    mimeType: string;
+  } {
+    const resolvedPath = path.resolve(filePath);
+
+    if (!fs.existsSync(resolvedPath)) {
+      throw new Error(`File does not exist: ${resolvedPath}`);
+    }
+
+    const stats = fs.statSync(resolvedPath);
+    if (!stats.isFile()) {
+      throw new Error(`Path is not a file: ${resolvedPath}`);
+    }
+
+    return {
+      resolvedPath,
+      fileName: path.basename(resolvedPath),
+      fileBuffer: fs.readFileSync(resolvedPath),
+      mimeType: lookup(resolvedPath) || "application/octet-stream",
+    };
+  }
+
+  private toBlobPart(fileBuffer: Buffer): ArrayBuffer {
+    return Uint8Array.from(fileBuffer).buffer;
+  }
+
+  private createModelBasedEntityFileUploadFormData(filePath: string): {
+    formData: FormData;
+  } {
+    const { fileName, fileBuffer, mimeType } = this.getLocalFileForUpload(filePath);
+    const formData = new FormData();
+    formData.append(
+      "document",
+      new Blob([JSON.stringify({ fileName })], { type: "application/json" })
+    );
+    formData.append("file", new Blob([this.toBlobPart(fileBuffer)], { type: mimeType }), fileName);
+    return { formData };
+  }
+
+  private async uploadModelBasedEntityFile<T>(
+    entityId: string,
+    kind: "test" | "training",
+    filePath: string,
+    signal?: AbortSignal
+  ): Promise<T> {
+    const { formData } = this.createModelBasedEntityFileUploadFormData(filePath);
+    const encodedEntityId = encodeURIComponent(entityId);
+    const res = await this.request(`/api/model-based-entities/${encodedEntityId}/${kind}/files`, {
+      method: "POST",
+      body: formData,
+    }, signal);
+    return res.json() as Promise<T>;
+  }
+
+  private unwrapModelBasedEntity(
+    data: ModelBasedEntityApiModel | { entity: ModelBasedEntityApiModel; version?: ModelBasedEntityVersionApiModel }
+  ): ModelBasedEntityApiModel {
+    return typeof data === "object" && data !== null && "entity" in data ? data.entity : data;
+  }
+
+  private normalizePaginatedModelBasedEntityListResponse(
+    data:
+      | ModelBasedEntityApiModel[]
+      | {
+          records?: ModelBasedEntityApiModel[];
+          entities?: ModelBasedEntityApiModel[];
+          items?: ModelBasedEntityApiModel[];
+          customEntities?: ModelBasedEntityApiModel[];
+          offset?: number;
+          limit?: number;
+          pageNumber?: number;
+          totalPages?: number;
+          totalRecords?: number;
+          absoluteTotalRecords?: number;
+          hasPreviousPage?: boolean;
+          hasNextPage?: boolean;
+          search?: string;
+          users?: string[];
+          statuses?: string[];
+          sortBy?: string;
+          sortDirection?: string;
+        },
+    options: ListAllModelBasedEntitiesOptions = {}
+  ): PaginatedModelBasedEntityListResponse {
+    if (Array.isArray(data)) {
+      return {
+        records: data,
+        ...(typeof options.offset === "number" ? { offset: options.offset } : {}),
+        ...(typeof options.limit === "number" ? { limit: options.limit } : {}),
+        ...(typeof options.search === "string" ? { search: options.search } : {}),
+        ...(Array.isArray(options.users) && options.users.length > 0 ? { users: options.users } : {}),
+        ...(Array.isArray(options.statuses) && options.statuses.length > 0 ? { statuses: options.statuses } : {}),
+        ...(typeof options.sortBy === "string" ? { sortBy: options.sortBy } : {}),
+        ...(typeof options.sortDirection === "string" ? { sortDirection: options.sortDirection } : {}),
+        totalRecords: data.length,
+      };
+    }
+
+    const records = Array.isArray(data.records)
+      ? data.records
+      : Array.isArray(data.entities)
+        ? data.entities
+        : Array.isArray(data.items)
+          ? data.items
+          : Array.isArray(data.customEntities)
+            ? data.customEntities
+            : null;
+
+    if (!records) {
+      throw new Error("Unexpected custom entities response shape");
+    }
+
+    return {
+      records,
+      ...(typeof data.offset === "number"
+        ? { offset: data.offset }
+        : typeof options.offset === "number"
+          ? { offset: options.offset }
+          : {}),
+      ...(typeof data.limit === "number"
+        ? { limit: data.limit }
+        : typeof options.limit === "number"
+          ? { limit: options.limit }
+          : {}),
+      ...(typeof data.pageNumber === "number" ? { pageNumber: data.pageNumber } : {}),
+      ...(typeof data.totalPages === "number" ? { totalPages: data.totalPages } : {}),
+      ...(typeof data.absoluteTotalRecords === "number" ? { absoluteTotalRecords: data.absoluteTotalRecords } : {}),
+      ...(typeof data.hasPreviousPage === "boolean" ? { hasPreviousPage: data.hasPreviousPage } : {}),
+      ...(typeof data.hasNextPage === "boolean" ? { hasNextPage: data.hasNextPage } : {}),
+      ...(typeof data.search === "string"
+        ? { search: data.search }
+        : typeof options.search === "string"
+          ? { search: options.search }
+          : {}),
+      ...(Array.isArray(data.users) && data.users.length > 0
+        ? { users: data.users }
+        : Array.isArray(options.users) && options.users.length > 0
+          ? { users: options.users }
+          : {}),
+      ...(Array.isArray(data.statuses) && data.statuses.length > 0
+        ? { statuses: data.statuses }
+        : Array.isArray(options.statuses) && options.statuses.length > 0
+          ? { statuses: options.statuses }
+          : {}),
+      ...(typeof data.sortBy === "string"
+        ? { sortBy: data.sortBy }
+        : typeof options.sortBy === "string"
+          ? { sortBy: options.sortBy }
+          : {}),
+      ...(typeof data.sortDirection === "string"
+        ? { sortDirection: data.sortDirection }
+        : typeof options.sortDirection === "string"
+          ? { sortDirection: options.sortDirection }
+          : {}),
+      totalRecords:
+        typeof data.totalRecords === "number"
+          ? data.totalRecords
+          : records.length,
+    };
+  }
+
+  private normalizeModelBasedEntityTrainingFileListResponse(
+    data:
+      | ModelBasedEntityTrainingFileApiModel[]
+      | {
+          files?: ModelBasedEntityTrainingFileApiModel[];
+          trainingFiles?: ModelBasedEntityTrainingFileApiModel[];
+          items?: ModelBasedEntityTrainingFileApiModel[];
+          search?: string;
+          offset?: number;
+          limit?: number;
+          totalCount?: number;
+          total?: number;
+          count?: number;
+        },
+    options: ListEntityTrainingFilesOptions = {}
+  ): ModelBasedEntityTrainingFileListResponse {
+    if (Array.isArray(data)) {
+      return {
+        files: data,
+        ...(typeof options.search === "string" ? { search: options.search } : {}),
+        ...(typeof options.offset === "number" ? { offset: options.offset } : {}),
+        ...(typeof options.limit === "number" ? { limit: options.limit } : {}),
+        totalCount: data.length,
+      };
+    }
+
+    const files = Array.isArray(data.files)
+      ? data.files
+      : Array.isArray(data.trainingFiles)
+        ? data.trainingFiles
+        : Array.isArray(data.items)
+          ? data.items
+          : null;
+
+    if (!files) {
+      throw new Error("Unexpected entity training files response shape");
+    }
+
+    return {
+      files,
+      ...(typeof data.search === "string"
+        ? { search: data.search }
+        : typeof options.search === "string"
+          ? { search: options.search }
+          : {}),
+      ...(typeof data.offset === "number"
+        ? { offset: data.offset }
+        : typeof options.offset === "number"
+          ? { offset: options.offset }
+          : {}),
+      ...(typeof data.limit === "number"
+        ? { limit: data.limit }
+        : typeof options.limit === "number"
+          ? { limit: options.limit }
+          : {}),
+      totalCount:
+        typeof data.totalCount === "number"
+          ? data.totalCount
+          : typeof data.total === "number"
+            ? data.total
+            : typeof data.count === "number"
+              ? data.count
+              : files.length,
+    };
+  }
+
+  private normalizeTrainedModelListResponse(
+    data:
+      | ModelBasedEntityTrainedModelApiModel[]
+      | {
+          models?: ModelBasedEntityTrainedModelApiModel[];
+          trainedModels?: ModelBasedEntityTrainedModelApiModel[];
+          items?: ModelBasedEntityTrainedModelApiModel[];
+          records?: ModelBasedEntityTrainedModelApiModel[];
+        }
+  ): ModelBasedEntityTrainedModelApiModel[] {
+    if (Array.isArray(data)) {
+      return data;
+    }
+
+    const models = Array.isArray(data.models)
+      ? data.models
+      : Array.isArray(data.trainedModels)
+        ? data.trainedModels
+        : Array.isArray(data.items)
+          ? data.items
+          : Array.isArray(data.records)
+            ? data.records
+            : null;
+
+    if (!models) {
+      throw new Error("Unexpected trained models response shape");
+    }
+
+    return models;
+  }
+
+  private normalizeModelTrainingFileListResponse(
+    data:
+      | ModelBasedEntityModelTrainingFileApiModel[]
+      | {
+          files?: ModelBasedEntityModelTrainingFileApiModel[];
+          modelTrainingFiles?: ModelBasedEntityModelTrainingFileApiModel[];
+          records?: ModelBasedEntityModelTrainingFileApiModel[];
+          items?: ModelBasedEntityModelTrainingFileApiModel[];
+          search?: string;
+          offset?: number;
+          limit?: number;
+          totalCount?: number;
+          totalRecords?: number;
+          total?: number;
+          count?: number;
+          absoluteTotalRecords?: number;
+          totalPages?: number;
+        },
+    options: ListModelTrainingFilesOptions = {}
+  ): ModelBasedEntityModelTrainingFileListResponse {
+    if (Array.isArray(data)) {
+      return {
+        files: data,
+        ...(typeof options.search === "string" ? { search: options.search } : {}),
+        ...(typeof options.offset === "number" ? { offset: options.offset } : {}),
+        ...(typeof options.limit === "number" ? { limit: options.limit } : {}),
+        totalCount: data.length,
+      };
+    }
+
+    const files = Array.isArray(data.files)
+      ? data.files
+      : Array.isArray(data.modelTrainingFiles)
+        ? data.modelTrainingFiles
+        : Array.isArray(data.records)
+          ? data.records
+          : Array.isArray(data.items)
+            ? data.items
+            : null;
+
+    if (!files) {
+      throw new Error("Unexpected model training files response shape");
+    }
+
+    return {
+      files,
+      ...(typeof data.search === "string"
+        ? { search: data.search }
+        : typeof options.search === "string"
+          ? { search: options.search }
+          : {}),
+      ...(typeof data.offset === "number"
+        ? { offset: data.offset }
+        : typeof options.offset === "number"
+          ? { offset: options.offset }
+          : {}),
+      ...(typeof data.limit === "number"
+        ? { limit: data.limit }
+        : typeof options.limit === "number"
+          ? { limit: options.limit }
+          : {}),
+      ...(typeof data.absoluteTotalRecords === "number" ? { absoluteTotalCount: data.absoluteTotalRecords } : {}),
+      ...(typeof data.totalPages === "number" ? { totalPages: data.totalPages } : {}),
+      totalCount:
+        typeof data.totalCount === "number"
+          ? data.totalCount
+          : typeof data.totalRecords === "number"
+            ? data.totalRecords
+            : typeof data.total === "number"
+              ? data.total
+              : typeof data.count === "number"
+                ? data.count
+                : files.length,
+    };
+  }
+
+  private normalizeModelDetectedEntityListResponse(
+    data:
+      | ModelBasedEntityDetectedEntityApiModel[]
+      | {
+          entities?: ModelBasedEntityDetectedEntityApiModel[];
+          records?: ModelBasedEntityDetectedEntityApiModel[];
+          items?: ModelBasedEntityDetectedEntityApiModel[];
+          search?: string;
+          offset?: number;
+          limit?: number;
+          totalCount?: number;
+          totalRecords?: number;
+          total?: number;
+          count?: number;
+        },
+    options: ListModelDetectedEntitiesOptions = {}
+  ): ModelBasedEntityDetectedEntityListResponse {
+    if (Array.isArray(data)) {
+      return {
+        entities: data,
+        ...(typeof options.search === "string" ? { search: options.search } : {}),
+        ...(typeof options.offset === "number" ? { offset: options.offset } : {}),
+        ...(typeof options.limit === "number" ? { limit: options.limit } : {}),
+        totalCount: data.length,
+      };
+    }
+
+    const entities = Array.isArray(data.entities)
+      ? data.entities
+      : Array.isArray(data.records)
+        ? data.records
+        : Array.isArray(data.items)
+          ? data.items
+          : null;
+
+    if (!entities) {
+      throw new Error("Unexpected model detected entities response shape");
+    }
+
+    return {
+      entities,
+      ...(typeof data.search === "string"
+        ? { search: data.search }
+        : typeof options.search === "string"
+          ? { search: options.search }
+          : {}),
+      ...(typeof data.offset === "number"
+        ? { offset: data.offset }
+        : typeof options.offset === "number"
+          ? { offset: options.offset }
+          : {}),
+      ...(typeof data.limit === "number"
+        ? { limit: data.limit }
+        : typeof options.limit === "number"
+          ? { limit: options.limit }
+          : {}),
+      totalCount:
+        typeof data.totalCount === "number"
+          ? data.totalCount
+          : typeof data.totalRecords === "number"
+            ? data.totalRecords
+            : typeof data.total === "number"
+              ? data.total
+              : typeof data.count === "number"
+                ? data.count
+                : entities.length,
+    };
+  }
+
   // --- Text Redaction ---
 
   private redactPayload(opts: RedactOptions): Record<string, unknown> {
@@ -297,7 +979,7 @@ export class TextualClient {
         { type: "application/json" }
       )
     );
-    formData.append("file", new Blob([fileBuffer], { type: mimeType }), fileName);
+    formData.append("file", new Blob([this.toBlobPart(fileBuffer)], { type: mimeType }), fileName);
 
     const res = await this.request("/api/unattachedfile/upload", {
       method: "POST",
@@ -370,7 +1052,7 @@ export class TextualClient {
         { type: "application/json" }
       )
     );
-    formData.append("file", new Blob([fileBuffer], { type: mimeType }), fileName);
+    formData.append("file", new Blob([this.toBlobPart(fileBuffer)], { type: mimeType }), fileName);
 
     const res = await this.request(`/api/Dataset/${datasetId}/files/upload`, {
       method: "POST",
@@ -416,5 +1098,584 @@ export class TextualClient {
     );
     const arrayBuf = await res.arrayBuffer();
     return Buffer.from(arrayBuf);
+  }
+
+  // --- Model-based Entities (Phase 1) ---
+
+  async createModelBasedEntity(
+    name: string,
+    guidelines: string
+  ): Promise<ModelBasedEntityApiModel> {
+    const data = await this.json<
+      ModelBasedEntityApiModel
+      | { entity: ModelBasedEntityApiModel; version?: ModelBasedEntityVersionApiModel }
+    >("/api/model-based-entities", {
+      method: "POST",
+      body: JSON.stringify({ name, guidelines } satisfies CreateModelBasedEntityRequest),
+    });
+
+    return this.unwrapModelBasedEntity(data);
+  }
+
+  async listModelBasedEntities(): Promise<ModelBasedEntityApiModel[]> {
+    const data = await this.json<
+      ModelBasedEntityApiModel[]
+      | { entities: ModelBasedEntityApiModel[] }
+    >("/api/model-based-entities/active");
+
+    return Array.isArray(data) ? data : data.entities;
+  }
+
+  async listAllModelBasedEntities(
+    options: ListAllModelBasedEntitiesOptions = {}
+  ): Promise<PaginatedModelBasedEntityListResponse> {
+    const search = options.search?.trim();
+    const users = options.users?.map((user) => user.trim()).filter((user) => user.length > 0);
+    const statuses = options.statuses?.map((status) => status.trim()).filter((status) => status.length > 0);
+    const sortBy = options.sortBy?.trim();
+    const sortDirection = options.sortDirection?.trim();
+    const params = new URLSearchParams();
+    params.set("entityType", "ModelBased");
+
+    if (search) {
+      params.set("search", search);
+    }
+
+    if (typeof options.offset === "number") {
+      params.set("offset", String(options.offset));
+    }
+
+    if (typeof options.limit === "number") {
+      params.set("limit", String(options.limit));
+    }
+
+    for (const user of users ?? []) {
+      params.append("users", user);
+    }
+
+    for (const status of statuses ?? []) {
+      params.append("statuses", status);
+    }
+
+    if (sortBy) {
+      params.set("sortBy", sortBy);
+    }
+
+    if (sortDirection) {
+      params.set("sortDirection", sortDirection);
+    }
+
+    const query = params.toString();
+    const data = await this.json<
+      | ModelBasedEntityApiModel[]
+      | {
+          records?: ModelBasedEntityApiModel[];
+          entities?: ModelBasedEntityApiModel[];
+          items?: ModelBasedEntityApiModel[];
+          customEntities?: ModelBasedEntityApiModel[];
+          offset?: number;
+          limit?: number;
+          pageNumber?: number;
+          totalPages?: number;
+          totalRecords?: number;
+          absoluteTotalRecords?: number;
+          hasPreviousPage?: boolean;
+          hasNextPage?: boolean;
+          search?: string;
+          users?: string[];
+          statuses?: string[];
+          sortBy?: string;
+          sortDirection?: string;
+        }
+    >(`/api/custom-entities${query ? `?${query}` : ""}`);
+
+    return this.normalizePaginatedModelBasedEntityListResponse(data, {
+      offset: options.offset,
+      limit: options.limit,
+      search,
+      users,
+      statuses,
+      sortBy,
+      sortDirection,
+    });
+  }
+
+  async getModelBasedEntity(entityId: string): Promise<ModelBasedEntityApiModel> {
+    const encodedEntityId = encodeURIComponent(entityId);
+    const data = await this.json<
+      ModelBasedEntityApiModel
+      | { entity: ModelBasedEntityApiModel; version?: ModelBasedEntityVersionApiModel }
+    >(`/api/model-based-entities/${encodedEntityId}`);
+
+    return this.unwrapModelBasedEntity(data);
+  }
+
+  async updateModelBasedEntity(
+    entityId: string,
+    updates: UpdateModelBasedEntityRequest
+  ): Promise<ModelBasedEntityApiModel> {
+    const encodedEntityId = encodeURIComponent(entityId);
+    const data = await this.json<
+      ModelBasedEntityApiModel
+      | { entity: ModelBasedEntityApiModel; version?: ModelBasedEntityVersionApiModel }
+    >(`/api/model-based-entities/${encodedEntityId}`, {
+      method: "PUT",
+      body: JSON.stringify(updates),
+    });
+
+    return this.unwrapModelBasedEntity(data);
+  }
+
+  async deleteModelBasedEntity(
+    entityId: string
+  ): Promise<ModelBasedEntityActionResponse | ModelBasedEntityApiModel | null> {
+    const encodedEntityId = encodeURIComponent(entityId);
+    const res = await this.request(`/api/model-based-entities/${encodedEntityId}`, {
+      method: "DELETE",
+    });
+    return this.jsonOrNull<ModelBasedEntityActionResponse | ModelBasedEntityApiModel>(res);
+  }
+
+  async createEntityVersion(
+    entityId: string,
+    guidelines: string
+  ): Promise<ModelBasedEntityVersionApiModel> {
+    const encodedEntityId = encodeURIComponent(entityId);
+    return this.json(`/api/model-based-entities/${encodedEntityId}/versions`, {
+      method: "POST",
+      body: JSON.stringify({ guidelines } satisfies CreateEntityVersionRequest),
+    });
+  }
+
+  async getSuggestedGuidelines(
+    entityId: string,
+    versionId: string
+  ): Promise<ModelBasedEntitySuggestedGuidelinesApiModel> {
+    const encodedEntityId = encodeURIComponent(entityId);
+    const encodedVersionId = encodeURIComponent(versionId);
+    const data = await this.json<ModelBasedEntitySuggestedGuidelinesApiModel | string>(
+      `/api/model-based-entities/${encodedEntityId}/versions/${encodedVersionId}/suggested-guidelines`,
+      {}
+    );
+    return typeof data === "string" ? { guidelines: data } : data;
+  }
+
+  async listEntityVersions(entityId: string): Promise<ModelBasedEntityVersionApiModel[]> {
+    const encodedEntityId = encodeURIComponent(entityId);
+    const data = await this.json<
+      ModelBasedEntityVersionApiModel[]
+      | { versions: ModelBasedEntityVersionApiModel[] | Record<string, string> }
+    >(`/api/model-based-entities/${encodedEntityId}/versions`);
+
+    if (Array.isArray(data)) {
+      return data;
+    }
+
+    const { versions } = data;
+
+    if (Array.isArray(versions)) {
+      return versions;
+    }
+
+    if (versions && typeof versions === "object") {
+      const versionIds = Object.values(versions).filter((versionId): versionId is string => typeof versionId === "string");
+
+      if (versionIds.length === Object.keys(versions).length) {
+        return Promise.all(versionIds.map((versionId) => this.getEntityVersion(entityId, versionId)));
+      }
+    }
+
+    throw new Error("Unexpected entity versions response shape");
+  }
+
+  async retryVersionAnnotation(
+    entityId: string,
+    versionId: string
+  ): Promise<ModelBasedEntityActionResponse | ModelBasedEntityVersionApiModel | null> {
+    const encodedEntityId = encodeURIComponent(entityId);
+    const encodedVersionId = encodeURIComponent(versionId);
+    const res = await this.request(`/api/model-based-entities/${encodedEntityId}/versions/${encodedVersionId}/retry`, {
+      method: "POST",
+    });
+    return this.jsonOrNull<ModelBasedEntityActionResponse | ModelBasedEntityVersionApiModel>(res);
+  }
+
+  async retrySuggestedGuidelines(
+    entityId: string,
+    versionId: string
+  ): Promise<ModelBasedEntityActionResponse | ModelBasedEntityVersionApiModel | null> {
+    const encodedEntityId = encodeURIComponent(entityId);
+    const encodedVersionId = encodeURIComponent(versionId);
+    const res = await this.request(
+      `/api/model-based-entities/${encodedEntityId}/versions/${encodedVersionId}/suggested-guidelines/retry`,
+      {
+        method: "POST",
+      }
+    );
+    return this.jsonOrNull<ModelBasedEntityActionResponse | ModelBasedEntityVersionApiModel>(res);
+  }
+
+  async getSupportedEntityFileTypes(): Promise<string[]> {
+    const data = await this.json<
+      string[]
+      | { supportedFileTypes?: string[]; fileTypes?: string[] }
+    >("/api/model-based-entities/supported-file-types");
+
+    if (Array.isArray(data)) {
+      return data;
+    }
+
+    if (Array.isArray(data.supportedFileTypes)) {
+      return data.supportedFileTypes;
+    }
+
+    if (Array.isArray(data.fileTypes)) {
+      return data.fileTypes;
+    }
+
+    throw new Error("Unexpected supported entity file types response shape");
+  }
+
+  async uploadEntityTestFile(
+    entityId: string,
+    filePath: string
+  ): Promise<ModelBasedEntityFileMinimalApiModel> {
+    return this.uploadModelBasedEntityFile(entityId, "test", filePath);
+  }
+
+  async listEntityTestFiles(entityId: string): Promise<ModelBasedEntityFileMinimalApiModel[]> {
+    const encodedEntityId = encodeURIComponent(entityId);
+    const data = await this.json<
+      ModelBasedEntityFileMinimalApiModel[]
+      | { files?: ModelBasedEntityFileMinimalApiModel[]; testFiles?: ModelBasedEntityFileMinimalApiModel[] }
+    >(`/api/model-based-entities/${encodedEntityId}/test/files`);
+
+    if (Array.isArray(data)) {
+      return data;
+    }
+
+    if (Array.isArray(data.files)) {
+      return data.files;
+    }
+
+    if (Array.isArray(data.testFiles)) {
+      return data.testFiles;
+    }
+
+    throw new Error("Unexpected entity test files response shape");
+  }
+
+  async deleteEntityTestFile(
+    entityId: string,
+    fileId: string
+  ): Promise<ModelBasedEntityActionResponse | ModelBasedEntityFileMinimalApiModel | null> {
+    const encodedEntityId = encodeURIComponent(entityId);
+    const encodedFileId = encodeURIComponent(fileId);
+    const res = await this.request(`/api/model-based-entities/${encodedEntityId}/test/files/${encodedFileId}`, {
+      method: "DELETE",
+    });
+    return this.jsonOrNull<ModelBasedEntityActionResponse | ModelBasedEntityFileMinimalApiModel>(res);
+  }
+
+  async saveEntityGroundTruth(
+    entityId: string,
+    fileId: string,
+    annotations: ModelBasedEntityAnnotationSpan[],
+    markAsReviewed: boolean
+  ): Promise<ModelBasedEntityFileFullApiModel | null> {
+    const encodedEntityId = encodeURIComponent(entityId);
+    const encodedFileId = encodeURIComponent(fileId);
+    const request: SaveEntityGroundTruthRequest = { annotations, markAsReviewed };
+    const res = await this.request(`/api/model-based-entities/${encodedEntityId}/test/files/${encodedFileId}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(request),
+    });
+
+    return this.jsonOrNull<ModelBasedEntityFileFullApiModel>(res);
+  }
+
+  async uploadEntityTrainingFile(
+    entityId: string,
+    filePath: string
+  ): Promise<ModelBasedEntityTrainingFileApiModel> {
+    return this.uploadModelBasedEntityFile(entityId, "training", filePath);
+  }
+
+  async listEntityTrainingFiles(
+    entityId: string,
+    options: ListEntityTrainingFilesOptions = {}
+  ): Promise<ModelBasedEntityTrainingFileListResponse> {
+    const encodedEntityId = encodeURIComponent(entityId);
+    const search = options.search?.trim();
+    const params = new URLSearchParams();
+
+    if (search) {
+      params.set("search", search);
+    }
+
+    if (typeof options.offset === "number") {
+      params.set("offset", String(options.offset));
+    }
+
+    if (typeof options.limit === "number") {
+      params.set("limit", String(options.limit));
+    }
+
+    const query = params.toString();
+    const data = await this.json<
+      | ModelBasedEntityTrainingFileApiModel[]
+      | {
+          files?: ModelBasedEntityTrainingFileApiModel[];
+          trainingFiles?: ModelBasedEntityTrainingFileApiModel[];
+          items?: ModelBasedEntityTrainingFileApiModel[];
+          search?: string;
+          offset?: number;
+          limit?: number;
+          totalCount?: number;
+          total?: number;
+          count?: number;
+        }
+    >(`/api/model-based-entities/${encodedEntityId}/training/files${query ? `?${query}` : ""}`);
+
+    return this.normalizeModelBasedEntityTrainingFileListResponse(data, {
+      ...options,
+      search,
+    });
+  }
+
+  async getEntityTrainingFile(
+    entityId: string,
+    fileId: string
+  ): Promise<ModelBasedEntityTrainingFileFullApiModel> {
+    const encodedEntityId = encodeURIComponent(entityId);
+    const encodedFileId = encodeURIComponent(fileId);
+    return this.json(`/api/model-based-entities/${encodedEntityId}/training/files/${encodedFileId}`);
+  }
+
+  async deleteEntityTrainingFile(
+    entityId: string,
+    fileId: string
+  ): Promise<ModelBasedEntityActionResponse | ModelBasedEntityTrainingFileApiModel | null> {
+    const encodedEntityId = encodeURIComponent(entityId);
+    const encodedFileId = encodeURIComponent(fileId);
+    const res = await this.request(`/api/model-based-entities/${encodedEntityId}/training/files/${encodedFileId}`, {
+      method: "DELETE",
+    });
+    return this.jsonOrNull<ModelBasedEntityActionResponse | ModelBasedEntityTrainingFileApiModel>(res);
+  }
+
+  async createTrainedModel(
+    entityId: string,
+    versionId: string
+  ): Promise<ModelBasedEntityTrainedModelApiModel> {
+    const encodedEntityId = encodeURIComponent(entityId);
+    return this.json(`/api/model-based-entities/${encodedEntityId}/training/models`, {
+      method: "POST",
+      body: JSON.stringify({ versionId } satisfies CreateTrainedModelRequest),
+    });
+  }
+
+  async listTrainedModels(entityId: string): Promise<ModelBasedEntityTrainedModelApiModel[]> {
+    const encodedEntityId = encodeURIComponent(entityId);
+    const data = await this.json<
+      | ModelBasedEntityTrainedModelApiModel[]
+      | {
+          models?: ModelBasedEntityTrainedModelApiModel[];
+          trainedModels?: ModelBasedEntityTrainedModelApiModel[];
+          items?: ModelBasedEntityTrainedModelApiModel[];
+          records?: ModelBasedEntityTrainedModelApiModel[];
+        }
+    >(`/api/model-based-entities/${encodedEntityId}/training/models`);
+
+    return this.normalizeTrainedModelListResponse(data);
+  }
+
+  async getTrainedModel(
+    entityId: string,
+    modelId: string
+  ): Promise<ModelBasedEntityTrainedModelApiModel> {
+    const encodedEntityId = encodeURIComponent(entityId);
+    const encodedModelId = encodeURIComponent(modelId);
+    return this.json(`/api/model-based-entities/${encodedEntityId}/training/models/${encodedModelId}`);
+  }
+
+  async listModelTrainingFiles(
+    entityId: string,
+    modelId: string,
+    options: ListModelTrainingFilesOptions = {}
+  ): Promise<ModelBasedEntityModelTrainingFileListResponse> {
+    const encodedEntityId = encodeURIComponent(entityId);
+    const encodedModelId = encodeURIComponent(modelId);
+    const search = options.search?.trim();
+    const params = new URLSearchParams();
+
+    if (search) {
+      params.set("search", search);
+    }
+
+    if (typeof options.offset === "number") {
+      params.set("offset", String(options.offset));
+    }
+
+    if (typeof options.limit === "number") {
+      params.set("limit", String(options.limit));
+    }
+
+    const query = params.toString();
+    const data = await this.json<
+      | ModelBasedEntityModelTrainingFileApiModel[]
+      | {
+          files?: ModelBasedEntityModelTrainingFileApiModel[];
+          modelTrainingFiles?: ModelBasedEntityModelTrainingFileApiModel[];
+          records?: ModelBasedEntityModelTrainingFileApiModel[];
+          items?: ModelBasedEntityModelTrainingFileApiModel[];
+          search?: string;
+          offset?: number;
+          limit?: number;
+          totalCount?: number;
+          totalRecords?: number;
+          total?: number;
+          count?: number;
+          absoluteTotalRecords?: number;
+          totalPages?: number;
+        }
+    >(`/api/model-based-entities/${encodedEntityId}/training/models/${encodedModelId}/files${query ? `?${query}` : ""}`);
+
+    return this.normalizeModelTrainingFileListResponse(data, {
+      ...options,
+      search,
+    });
+  }
+
+  async getModelTrainingFile(
+    entityId: string,
+    modelId: string,
+    fileId: string
+  ): Promise<ModelBasedEntityModelTrainingFileFullApiModel> {
+    const encodedEntityId = encodeURIComponent(entityId);
+    const encodedModelId = encodeURIComponent(modelId);
+    const encodedFileId = encodeURIComponent(fileId);
+    return this.json(`/api/model-based-entities/${encodedEntityId}/training/models/${encodedModelId}/files/${encodedFileId}`);
+  }
+
+  async listModelDetectedEntities(
+    entityId: string,
+    modelId: string,
+    options: ListModelDetectedEntitiesOptions = {}
+  ): Promise<ModelBasedEntityDetectedEntityListResponse> {
+    const encodedEntityId = encodeURIComponent(entityId);
+    const encodedModelId = encodeURIComponent(modelId);
+    const search = options.search?.trim();
+    const params = new URLSearchParams();
+
+    if (search) {
+      params.set("search", search);
+    }
+
+    if (typeof options.offset === "number") {
+      params.set("offset", String(options.offset));
+    }
+
+    if (typeof options.limit === "number") {
+      params.set("limit", String(options.limit));
+    }
+
+    const query = params.toString();
+    const data = await this.json<
+      | ModelBasedEntityDetectedEntityApiModel[]
+      | {
+          entities?: ModelBasedEntityDetectedEntityApiModel[];
+          records?: ModelBasedEntityDetectedEntityApiModel[];
+          items?: ModelBasedEntityDetectedEntityApiModel[];
+          search?: string;
+          offset?: number;
+          limit?: number;
+          totalCount?: number;
+          totalRecords?: number;
+          total?: number;
+          count?: number;
+        }
+    >(`/api/model-based-entities/${encodedEntityId}/training/models/${encodedModelId}/entities-detected${query ? `?${query}` : ""}`);
+
+    return this.normalizeModelDetectedEntityListResponse(data, {
+      ...options,
+      search,
+    });
+  }
+
+  async startModelTraining(
+    entityId: string,
+    modelId: string
+  ): Promise<StartModelTrainingResponse | ModelBasedEntityTrainedModelApiModel | null> {
+    const encodedEntityId = encodeURIComponent(entityId);
+    const encodedModelId = encodeURIComponent(modelId);
+    const res = await this.request(`/api/model-based-entities/${encodedEntityId}/training/models/${encodedModelId}/train`, {
+      method: "POST",
+    });
+    return this.jsonOrNull<StartModelTrainingResponse | ModelBasedEntityTrainedModelApiModel>(res);
+  }
+
+  async activateTrainedModel(
+    entityId: string,
+    modelId: string
+  ): Promise<ActivateTrainedModelResponse | ModelBasedEntityTrainedModelApiModel | null> {
+    const encodedEntityId = encodeURIComponent(entityId);
+    const encodedModelId = encodeURIComponent(modelId);
+    const res = await this.request(`/api/model-based-entities/${encodedEntityId}/training/models/${encodedModelId}/activate`, {
+      method: "POST",
+    });
+    return this.jsonOrNull<ActivateTrainedModelResponse | ModelBasedEntityTrainedModelApiModel>(res);
+  }
+
+  async getEntityVersion(
+    entityId: string,
+    versionId: string
+  ): Promise<ModelBasedEntityVersionApiModel> {
+    const encodedEntityId = encodeURIComponent(entityId);
+    const encodedVersionId = encodeURIComponent(versionId);
+    return this.json(`/api/model-based-entities/${encodedEntityId}/versions/${encodedVersionId}`);
+  }
+
+  async getEntityFileAnnotations(
+    entityId: string,
+    versionId: string,
+    fileId: string,
+    forcePredictions?: boolean
+  ): Promise<ModelBasedEntityFileVersionRecordWithAnnotations> {
+    const encodedEntityId = encodeURIComponent(entityId);
+    const encodedVersionId = encodeURIComponent(versionId);
+    const encodedFileId = encodeURIComponent(fileId);
+    const query = forcePredictions === undefined
+      ? ""
+      : `?forcePredictions=${forcePredictions ? "true" : "false"}`;
+    return this.json(
+      `/api/model-based-entities/${encodedEntityId}/versions/${encodedVersionId}/files/${encodedFileId}${query}`,
+      {}
+    );
+  }
+
+  async activateEntityForDataset(
+    entityId: string,
+    datasetId: string
+  ): Promise<ActivateEntityForDatasetResponse | ModelBasedEntityApiModel | null> {
+    const encodedEntityId = encodeURIComponent(entityId);
+    const encodedDatasetId = encodeURIComponent(datasetId);
+    const res = await this.request(`/api/model-based-entities/${encodedEntityId}/datasets/${encodedDatasetId}`, {
+      method: "POST",
+    });
+    return this.jsonOrNull<ActivateEntityForDatasetResponse | ModelBasedEntityApiModel>(res);
+  }
+
+  async deactivateEntityForDataset(
+    entityId: string,
+    datasetId: string
+  ): Promise<DeactivateEntityForDatasetResponse | ModelBasedEntityApiModel | null> {
+    const encodedEntityId = encodeURIComponent(entityId);
+    const encodedDatasetId = encodeURIComponent(datasetId);
+    const res = await this.request(`/api/model-based-entities/${encodedEntityId}/datasets/${encodedDatasetId}`, {
+      method: "DELETE",
+    });
+    return this.jsonOrNull<DeactivateEntityForDatasetResponse | ModelBasedEntityApiModel>(res);
   }
 }

@@ -15,8 +15,20 @@ import {
   type GeneratorConfig,
   type GeneratorHandling,
   type GeneratorMetadataEntry,
+  type ModelBasedEntityAnnotationSpan,
+  type ModelBasedEntityDetectedEntityApiModel,
   type JsonRedactOptions,
   type LabelCustomList,
+  type ModelBasedEntityApiModel,
+  type ModelBasedEntityFileFullApiModel,
+  type ModelBasedEntityFileMinimalApiModel,
+  type ModelBasedEntityFileVersionRecordWithAnnotations,
+  type ModelBasedEntityModelTrainingFileApiModel,
+  type ModelBasedEntityModelTrainingFileFullApiModel,
+  type ModelBasedEntityTrainingFileApiModel,
+  type ModelBasedEntityTrainingFileFullApiModel,
+  type ModelBasedEntityTrainedModelApiModel,
+  type ModelBasedEntityVersionApiModel,
   type RedactOptions,
 } from "./textual-client.js";
 import { Logger, withLogging } from "./logger.js";
@@ -102,6 +114,515 @@ const redactOptionSchemas = {
   labelBlockLists: labelBlockListsSchema,
   labelAllowLists: labelAllowListsSchema,
 };
+
+const modelBasedEntityIdSchema = z.string().describe("The model-based entity ID");
+
+const modelBasedEntityVersionIdSchema = z.string().describe("The entity version ID");
+
+const modelBasedEntityNameSchema = z
+  .string()
+  .describe("Human-readable name for the model-based entity");
+
+const modelBasedEntityGuidelinesSchema = z
+  .string()
+  .describe("Guidelines that define how Textual should identify this model-based entity");
+
+const modelBasedEntityFileIdSchema = z.string().describe("The model-based entity file ID");
+
+const trainedModelIdSchema = z.string().describe("The trained model ID");
+
+const datasetIdSchema = z.string().describe("The dataset ID");
+
+const modelBasedEntityAnnotationSpanSchema = z.object({
+  start: z.number().int().nonnegative().describe("Inclusive character start offset for the annotation span"),
+  end: z.number().int().nonnegative().describe("Exclusive character end offset for the annotation span"),
+});
+
+const entityFileSearchSchema = z
+  .string()
+  .optional()
+  .describe("Optional search text to filter entity training files by file name or related indexed metadata");
+
+const modelDetectedEntitySearchSchema = z
+  .string()
+  .optional()
+  .describe("Optional search text to filter detected entity values by name");
+
+const customEntitySearchSchema = z
+  .string()
+  .optional()
+  .describe("Optional search text to filter the paginated custom-entity list by name or related indexed metadata");
+
+const paginationOffsetSchema = z.number().int().nonnegative().optional().describe("Zero-based offset into the paginated results");
+
+const paginationLimitSchema = z.number().int().positive().optional().describe("Maximum number of results to return");
+
+const customEntityUsersSchema = z
+  .array(z.string())
+  .optional()
+  .describe("Optional user identifiers to filter the paginated custom-entity list");
+
+const modelBasedEntityStatusesSchema = z
+  .array(z.string())
+  .optional()
+  .describe("Optional model-based entity lifecycle statuses to filter the paginated custom-entity list");
+
+const customEntitySortBySchema = z
+  .string()
+  .optional()
+  .describe("Optional server-side sort field for the paginated custom-entity list");
+
+const customEntitySortDirectionSchema = z
+  .string()
+  .optional()
+  .describe("Optional server-side sort direction for the paginated custom-entity list");
+
+function jsonTextResult(payload: unknown) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
+  };
+}
+
+function summarizeModelBasedEntity(entity: ModelBasedEntityApiModel) {
+  return {
+    entityId: entity.id,
+    name: entity.name,
+    displayName: entity.displayName,
+    status: entity.status,
+    activeModelId: entity.activeModelId,
+    datasetIds: entity.datasetIds,
+    lastModifiedDate: entity.lastModifiedDate,
+  };
+}
+
+function summarizeModelBasedEntityDetails(entity: ModelBasedEntityApiModel) {
+  return {
+    ...summarizeModelBasedEntity(entity),
+    fileSource: entity.fileSource,
+    createdByUserId: entity.createdByUserId,
+  };
+}
+
+function summarizeEntityVersion(
+  version: ModelBasedEntityVersionApiModel,
+  options: { includeGuidelines?: boolean; includeFiles?: boolean } = {}
+) {
+  return {
+    versionId: version.id,
+    entityId: version.entityId,
+    versionNumber: version.versionNumber,
+    status: version.status,
+    ...(options.includeGuidelines ? { guidelines: version.guidelines } : {}),
+    entityCount: version.entityCount,
+    f1Score: version.f1Score,
+    recallScore: version.recallScore,
+    precisionScore: version.precisionScore,
+    fileCount: version.files.length,
+    errorType: version.errorType,
+    errorDetails: version.errorDetails,
+    ...(options.includeFiles
+      ? {
+          files: version.files.map((file) => ({
+            versionFileId: file.id,
+            fileId: file.fileId,
+            fileName: file.fileName,
+            status: file.status,
+            numEntities: file.numEntities,
+            f1Score: file.f1Score,
+            recallScore: file.recallScore,
+            precisionScore: file.precisionScore,
+            errorType: file.errorType,
+            errorDetails: file.errorDetails,
+            createdAt: file.createdAt,
+          })),
+        }
+      : {}),
+  };
+}
+
+function summarizeTrainedModel(model: ModelBasedEntityTrainedModelApiModel) {
+  return {
+    modelId: model.id,
+    modelNumber: model.number,
+    entityId: model.entityId,
+    versionId: model.versionId,
+    status: model.status,
+    isActive: model.isActive,
+    progress: model.progress,
+    benchmarkScore: model.benchmarkScore,
+    entityCount: model.entityCount,
+    fileCount: model.fileCount,
+  };
+}
+
+function summarizeEntityTestFile(entityId: string, file: ModelBasedEntityFileMinimalApiModel) {
+  return {
+    entityId,
+    fileId: file.id,
+    fileName: file.fileName,
+    filePath: file.filePath,
+    minimumVersionId: file.minimumVersionId,
+    status: file.status,
+    errorType: file.errorType,
+    errorDetails: file.errorDetails,
+    createdAt: file.createdAt,
+  };
+}
+
+function summarizeSavedGroundTruth(entityId: string, fileId: string, file: ModelBasedEntityFileFullApiModel | null) {
+  if (!file) {
+    return {
+      entityId,
+      fileId,
+      message: "Ground truth saved.",
+    };
+  }
+
+  return {
+    ...summarizeEntityTestFile(entityId, file),
+    groundTruthCount: file.groundTruth.length,
+    groundTruth: file.groundTruth,
+    message: "Ground truth saved.",
+  };
+}
+
+function summarizeEntityTrainingFile(file: ModelBasedEntityTrainingFileApiModel) {
+  return {
+    entityId: file.entityId,
+    fileId: file.id,
+    fileName: file.fileName,
+    filePath: file.filePath,
+    status: file.status,
+    createdAt: file.createdAt,
+  };
+}
+
+function summarizeEntityTrainingFileDetails(file: ModelBasedEntityTrainingFileFullApiModel) {
+  return {
+    ...summarizeEntityTrainingFile(file),
+    deleted: file.deleted,
+    content: file.content,
+  };
+}
+
+function summarizeModelTrainingFile(file: ModelBasedEntityModelTrainingFileApiModel) {
+  const details = file as Record<string, unknown>;
+  return {
+    modelTrainingFileId: file.id,
+    fileId: file.fileId,
+    fileName: file.fileName,
+    createdAt: file.createdAt,
+    deleted: file.deleted,
+    ...(typeof file.numEntities === "number" ? { numEntities: file.numEntities } : {}),
+    ...(typeof details.status === "string" ? { status: details.status } : {}),
+  };
+}
+
+function summarizeModelTrainingFileDetails(file: ModelBasedEntityModelTrainingFileFullApiModel) {
+  return {
+    ...summarizeModelTrainingFile(file),
+    annotationCount: file.annotations.length,
+    content: file.content,
+    annotations: file.annotations,
+  };
+}
+
+function summarizeModelDetectedEntity(entity: ModelBasedEntityDetectedEntityApiModel) {
+  return {
+    name: entity.name,
+    count: entity.count,
+  };
+}
+
+function summarizeEntityTestFileDeletion(entityId: string, fileId: string, response: unknown) {
+  if (
+    response &&
+    typeof response === "object" &&
+    "id" in response &&
+    typeof response.id === "string" &&
+    "minimumVersionId" in response
+  ) {
+    const file = response as ModelBasedEntityFileMinimalApiModel;
+    return {
+      ...summarizeEntityTestFile(entityId, file),
+      deleted: file.deleted,
+      message: "Entity test file deleted.",
+    };
+  }
+
+  if (response && typeof response === "object") {
+    const details = response as Record<string, unknown>;
+    return {
+      entityId,
+      fileId,
+      status: typeof details.status === "string" ? details.status : "accepted",
+      ...(Object.keys(details).length > 0 ? { details } : {}),
+      message: "Entity test file delete request submitted.",
+    };
+  }
+
+  return {
+    entityId,
+    fileId,
+    status: "accepted",
+    message: "Entity test file delete request submitted.",
+  };
+}
+
+function summarizeEntityTrainingFileDeletion(entityId: string, fileId: string, response: unknown) {
+  if (
+    response &&
+    typeof response === "object" &&
+    "id" in response &&
+    typeof response.id === "string" &&
+    "entityId" in response
+  ) {
+    const file = response as ModelBasedEntityTrainingFileApiModel;
+    return {
+      ...summarizeEntityTrainingFile(file),
+      deleted: file.deleted,
+      message: "Entity training file deleted.",
+    };
+  }
+
+  if (response && typeof response === "object") {
+    const details = response as Record<string, unknown>;
+    return {
+      entityId,
+      fileId,
+      status: typeof details.status === "string" ? details.status : "accepted",
+      ...(Object.keys(details).length > 0 ? { details } : {}),
+      message: "Entity training file delete request submitted.",
+    };
+  }
+
+  return {
+    entityId,
+    fileId,
+    status: "accepted",
+    message: "Entity training file delete request submitted.",
+  };
+}
+
+function summarizeEntityFileAnnotations(file: ModelBasedEntityFileVersionRecordWithAnnotations) {
+  return {
+    versionFileId: file.id,
+    fileId: file.fileId,
+    versionId: file.versionId,
+    fileName: file.fileName,
+    filePath: file.filePath,
+    status: file.status,
+    numEntities: file.numEntities,
+    f1Score: file.f1Score,
+    recallScore: file.recallScore,
+    precisionScore: file.precisionScore,
+    errorType: file.errorType,
+    errorDetails: file.errorDetails,
+    createdAt: file.createdAt,
+    annotationCount: file.annotations.length,
+    content: file.content,
+    annotations: file.annotations,
+  };
+}
+
+async function resolveLatestEntityVersionId(entityId: string): Promise<string> {
+  const versions = await client.listEntityVersions(entityId);
+  const latestVersion = versions.reduce<ModelBasedEntityVersionApiModel | null>((currentLatest, version) => {
+    if (!currentLatest || version.versionNumber > currentLatest.versionNumber) {
+      return version;
+    }
+
+    return currentLatest;
+  }, null);
+
+  if (!latestVersion) {
+    throw new Error(`No versions found for entity ${entityId}`);
+  }
+
+  return latestVersion.id;
+}
+
+function summarizeEntityDatasetActivation(entityId: string, datasetId: string, response: unknown) {
+  if (
+    response &&
+    typeof response === "object" &&
+    "id" in response &&
+    typeof response.id === "string" &&
+    "status" in response &&
+    typeof response.status === "string"
+  ) {
+    return {
+      datasetId,
+      ...summarizeModelBasedEntity(response as ModelBasedEntityApiModel),
+      message: "Entity activated for dataset.",
+    };
+  }
+
+  if (response && typeof response === "object") {
+    const details = response as Record<string, unknown>;
+    return {
+      entityId,
+      datasetId,
+      status: typeof details.status === "string" ? details.status : "accepted",
+      ...(Object.keys(details).length > 0 ? { details } : {}),
+      message: "Entity activated for dataset.",
+    };
+  }
+
+  return {
+    entityId,
+    datasetId,
+    status: "accepted",
+    message: "Entity activated for dataset.",
+  };
+}
+
+function summarizeEntityDatasetDeactivation(entityId: string, datasetId: string, response: unknown) {
+  if (
+    response &&
+    typeof response === "object" &&
+    "id" in response &&
+    typeof response.id === "string" &&
+    "status" in response &&
+    typeof response.status === "string"
+  ) {
+    return {
+      datasetId,
+      ...summarizeModelBasedEntity(response as ModelBasedEntityApiModel),
+      message: "Entity deactivated for dataset.",
+    };
+  }
+
+  if (response && typeof response === "object") {
+    const details = response as Record<string, unknown>;
+    return {
+      entityId,
+      datasetId,
+      status: typeof details.status === "string" ? details.status : "accepted",
+      ...(Object.keys(details).length > 0 ? { details } : {}),
+      message: "Entity deactivated for dataset.",
+    };
+  }
+
+  return {
+    entityId,
+    datasetId,
+    status: "accepted",
+    message: "Entity deactivated for dataset.",
+  };
+}
+
+function summarizeAsyncModelAction(action: string, entityId: string, modelId: string, response: unknown) {
+  if (response && typeof response === "object") {
+    if (
+      "id" in response &&
+      typeof response.id === "string" &&
+      "status" in response &&
+      typeof response.status === "string"
+    ) {
+      return {
+        action,
+        ...summarizeTrainedModel(response as ModelBasedEntityTrainedModelApiModel),
+      };
+    }
+
+    const details = response as Record<string, unknown>;
+    return {
+      action,
+      entityId,
+      modelId,
+      status: typeof details.status === "string" ? details.status : "accepted",
+      ...(Object.keys(details).length > 0 ? { details } : {}),
+    };
+  }
+
+  return {
+    action,
+    entityId,
+    modelId,
+    status: "accepted",
+  };
+}
+
+function summarizeAsyncEntityAction(action: string, entityId: string, response: unknown, message: string) {
+  if (
+    response &&
+    typeof response === "object" &&
+    "id" in response &&
+    typeof response.id === "string" &&
+    "status" in response &&
+    typeof response.status === "string"
+  ) {
+    return {
+      action,
+      ...summarizeModelBasedEntityDetails(response as ModelBasedEntityApiModel),
+      message,
+    };
+  }
+
+  if (response && typeof response === "object") {
+    const details = response as Record<string, unknown>;
+    return {
+      action,
+      entityId,
+      status: typeof details.status === "string" ? details.status : "accepted",
+      ...(Object.keys(details).length > 0 ? { details } : {}),
+      message,
+    };
+  }
+
+  return {
+    action,
+    entityId,
+    status: "accepted",
+    message,
+  };
+}
+
+function summarizeAsyncVersionAction(
+  action: string,
+  entityId: string,
+  versionId: string,
+  response: unknown,
+  message: string
+) {
+  if (
+    response &&
+    typeof response === "object" &&
+    "id" in response &&
+    typeof response.id === "string" &&
+    "entityId" in response &&
+    typeof response.entityId === "string" &&
+    "status" in response &&
+    typeof response.status === "string"
+  ) {
+    return {
+      action,
+      ...summarizeEntityVersion(response as ModelBasedEntityVersionApiModel),
+      message,
+    };
+  }
+
+  if (response && typeof response === "object") {
+    const details = response as Record<string, unknown>;
+    return {
+      action,
+      entityId,
+      versionId,
+      status: typeof details.status === "string" ? details.status : "accepted",
+      ...(Object.keys(details).length > 0 ? { details } : {}),
+      message,
+    };
+  }
+
+  return {
+    action,
+    entityId,
+    versionId,
+    status: "accepted",
+    message,
+  };
+}
 
 // Helper to build RedactOptions from tool params
 function buildRedactOpts(params: {
@@ -483,6 +1004,602 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(outputPath, buffer);
       return { content: [{ type: "text" as const, text: `Redacted file saved to: ${outputPath} (${buffer.length} bytes)` }] };
+    })
+  );
+
+  // --- create_model_based_entity ---
+  s.tool(
+    "create_model_based_entity",
+    "Create a new model-based entity with initial guidelines. Returns the entity ID and current lifecycle status.",
+    {
+      name: modelBasedEntityNameSchema,
+      guidelines: modelBasedEntityGuidelinesSchema,
+    },
+    withLogging(logger, "create_model_based_entity", async ({ name, guidelines }) => {
+      const entity = await client.createModelBasedEntity(name, guidelines);
+      return jsonTextResult({
+        ...summarizeModelBasedEntity(entity),
+        message: "Model-based entity created.",
+      });
+    })
+  );
+
+  // --- list_model_based_entities ---
+  s.tool(
+    "list_model_based_entities",
+    "List active model-based entities and their current lifecycle status.",
+    {},
+    withLogging(logger, "list_model_based_entities", async () => {
+      const entities = await client.listModelBasedEntities();
+      return jsonTextResult({
+        count: entities.length,
+        entities: entities.map((entity) => summarizeModelBasedEntity(entity)),
+      });
+    })
+  );
+
+  // --- list_all_model_based_entities ---
+  s.tool(
+    "list_all_model_based_entities",
+    "List all accessible model-based custom entities from the paginated custom-entities endpoint. Supports optional search, user/status filters, and server-side sorting while always constraining entityType to ModelBased.",
+    {
+      offset: paginationOffsetSchema,
+      limit: paginationLimitSchema,
+      search: customEntitySearchSchema,
+      users: customEntityUsersSchema,
+      statuses: modelBasedEntityStatusesSchema,
+      sortBy: customEntitySortBySchema,
+      sortDirection: customEntitySortDirectionSchema,
+    },
+    withLogging(
+      logger,
+      "list_all_model_based_entities",
+      async ({ offset, limit, search, users, statuses, sortBy, sortDirection }) => {
+        const result = await client.listAllModelBasedEntities({
+          offset,
+          limit,
+          search,
+          users,
+          statuses,
+          sortBy,
+          sortDirection,
+        });
+
+        return jsonTextResult({
+          count: result.records.length,
+          totalRecords: result.totalRecords,
+          ...(typeof result.offset === "number" ? { offset: result.offset } : {}),
+          ...(typeof result.limit === "number" ? { limit: result.limit } : {}),
+          ...(typeof result.pageNumber === "number" ? { pageNumber: result.pageNumber } : {}),
+          ...(typeof result.totalPages === "number" ? { totalPages: result.totalPages } : {}),
+          ...(typeof result.absoluteTotalRecords === "number"
+            ? { absoluteTotalRecords: result.absoluteTotalRecords }
+            : {}),
+          ...(typeof result.hasPreviousPage === "boolean" ? { hasPreviousPage: result.hasPreviousPage } : {}),
+          ...(typeof result.hasNextPage === "boolean" ? { hasNextPage: result.hasNextPage } : {}),
+          ...(typeof result.search === "string" ? { search: result.search } : {}),
+          ...(Array.isArray(result.users) && result.users.length > 0 ? { users: result.users } : {}),
+          ...(Array.isArray(result.statuses) && result.statuses.length > 0 ? { statuses: result.statuses } : {}),
+          ...(typeof result.sortBy === "string" ? { sortBy: result.sortBy } : {}),
+          ...(typeof result.sortDirection === "string" ? { sortDirection: result.sortDirection } : {}),
+          records: result.records.map((entity) => summarizeModelBasedEntity(entity)),
+        });
+      }
+    )
+  );
+
+  // --- get_model_based_entity ---
+  s.tool(
+    "get_model_based_entity",
+    "Get details for a specific model-based entity, including lifecycle status, file source, and current activation state.",
+    {
+      entityId: modelBasedEntityIdSchema,
+    },
+    withLogging(logger, "get_model_based_entity", async ({ entityId }) => {
+      const entity = await client.getModelBasedEntity(entityId);
+      return jsonTextResult(summarizeModelBasedEntityDetails(entity));
+    })
+  );
+
+  // --- update_model_based_entity ---
+  s.tool(
+    "update_model_based_entity",
+    "Update a model-based entity by sending a JSON object of fields accepted by Textual's entity update endpoint. Returns the updated entity state.",
+    {
+      entityId: modelBasedEntityIdSchema,
+      updates: z
+        .record(z.string(), z.unknown())
+        .describe("JSON object of fields to update, such as entity metadata or file-source configuration"),
+    },
+    withLogging(logger, "update_model_based_entity", async ({ entityId, updates }) => {
+      const entity = await client.updateModelBasedEntity(entityId, updates as Record<string, unknown>);
+      return jsonTextResult({
+        ...summarizeModelBasedEntityDetails(entity),
+        message: "Model-based entity updated.",
+      });
+    })
+  );
+
+  // --- delete_model_based_entity ---
+  s.tool(
+    "delete_model_based_entity",
+    "Delete a model-based entity. This returns an immediate status payload and does not wait for any downstream cleanup beyond the initial API response.",
+    {
+      entityId: modelBasedEntityIdSchema,
+    },
+    withLogging(logger, "delete_model_based_entity", async ({ entityId }) => {
+      const result = await client.deleteModelBasedEntity(entityId);
+      return jsonTextResult(
+        summarizeAsyncEntityAction(
+          "entity_delete_requested",
+          entityId,
+          result,
+          "Model-based entity delete request submitted."
+        )
+      );
+    })
+  );
+
+  // --- create_entity_version ---
+  s.tool(
+    "create_entity_version",
+    "Create a new version for an existing model-based entity using updated guidelines. Follow-up analysis may continue asynchronously; this returns immediately with the new version ID and current status.",
+    {
+      entityId: modelBasedEntityIdSchema,
+      guidelines: modelBasedEntityGuidelinesSchema,
+    },
+    withLogging(logger, "create_entity_version", async ({ entityId, guidelines }) => {
+      const version = await client.createEntityVersion(entityId, guidelines);
+      return jsonTextResult({
+        ...summarizeEntityVersion(version, { includeGuidelines: true }),
+        message: "Entity version created.",
+      });
+    })
+  );
+
+  // --- get_suggested_guidelines ---
+  s.tool(
+    "get_suggested_guidelines",
+    "Get suggested guideline refinements for a specific entity version after Textual has generated them.",
+    {
+      entityId: modelBasedEntityIdSchema,
+      versionId: modelBasedEntityVersionIdSchema,
+    },
+    withLogging(logger, "get_suggested_guidelines", async ({ entityId, versionId }) => {
+      const result = await client.getSuggestedGuidelines(entityId, versionId);
+      return jsonTextResult({ entityId, versionId, guidelines: result.guidelines });
+    })
+  );
+
+  // --- list_entity_versions ---
+  s.tool(
+    "list_entity_versions",
+    "List the versions for a model-based entity, including status and evaluation metrics for each version.",
+    {
+      entityId: modelBasedEntityIdSchema,
+    },
+    withLogging(logger, "list_entity_versions", async ({ entityId }) => {
+      const versions = await client.listEntityVersions(entityId);
+      return jsonTextResult({
+        entityId,
+        count: versions.length,
+        versions: versions.map((version) => summarizeEntityVersion(version)),
+      });
+    })
+  );
+
+  // --- retry_version_annotation ---
+  s.tool(
+    "retry_version_annotation",
+    "Retry annotation for a model-based entity version that needs another annotation pass. This returns immediately with the current accepted status payload.",
+    {
+      entityId: modelBasedEntityIdSchema,
+      versionId: modelBasedEntityVersionIdSchema,
+    },
+    withLogging(logger, "retry_version_annotation", async ({ entityId, versionId }) => {
+      const result = await client.retryVersionAnnotation(entityId, versionId);
+      return jsonTextResult(
+        summarizeAsyncVersionAction(
+          "version_annotation_retry_requested",
+          entityId,
+          versionId,
+          result,
+          "Version annotation retry requested."
+        )
+      );
+    })
+  );
+
+  // --- retry_suggested_guidelines ---
+  s.tool(
+    "retry_suggested_guidelines",
+    "Retry suggested-guideline generation for a model-based entity version. This returns immediately with the current accepted status payload.",
+    {
+      entityId: modelBasedEntityIdSchema,
+      versionId: modelBasedEntityVersionIdSchema,
+    },
+    withLogging(logger, "retry_suggested_guidelines", async ({ entityId, versionId }) => {
+      const result = await client.retrySuggestedGuidelines(entityId, versionId);
+      return jsonTextResult(
+        summarizeAsyncVersionAction(
+          "suggested_guidelines_retry_requested",
+          entityId,
+          versionId,
+          result,
+          "Suggested-guidelines retry requested."
+        )
+      );
+    })
+  );
+
+  // --- get_supported_entity_file_types ---
+  s.tool(
+    "get_supported_entity_file_types",
+    "List the MIME types supported for model-based entity test/training file ingestion.",
+    {},
+    withLogging(logger, "get_supported_entity_file_types", async () => {
+      const supportedFileTypes = await client.getSupportedEntityFileTypes();
+      return jsonTextResult({
+        count: supportedFileTypes.length,
+        supportedFileTypes,
+      });
+    })
+  );
+
+  // --- create_trained_model ---
+  s.tool(
+    "create_trained_model",
+    "Create a trained-model record for an entity version. Returns the model ID and current readiness status for follow-up training calls.",
+    {
+      entityId: modelBasedEntityIdSchema,
+      versionId: modelBasedEntityVersionIdSchema,
+    },
+    withLogging(logger, "create_trained_model", async ({ entityId, versionId }) => {
+      const model = await client.createTrainedModel(entityId, versionId);
+      return jsonTextResult({
+        ...summarizeTrainedModel(model),
+        message: "Trained model record created.",
+      });
+    })
+  );
+
+  // --- list_trained_models ---
+  s.tool(
+    "list_trained_models",
+    "List all trained models for a model-based entity, including readiness, progress, activation state, and benchmark summary fields.",
+    {
+      entityId: modelBasedEntityIdSchema,
+    },
+    withLogging(logger, "list_trained_models", async ({ entityId }) => {
+      const models = await client.listTrainedModels(entityId);
+      return jsonTextResult({
+        entityId,
+        count: models.length,
+        models: models.map((model) => summarizeTrainedModel(model)),
+      });
+    })
+  );
+
+  // --- get_trained_model ---
+  s.tool(
+    "get_trained_model",
+    "Get the current status of a trained model for a model-based entity.",
+    {
+      entityId: modelBasedEntityIdSchema,
+      modelId: trainedModelIdSchema,
+    },
+    withLogging(logger, "get_trained_model", async ({ entityId, modelId }) => {
+      const model = await client.getTrainedModel(entityId, modelId);
+      return jsonTextResult(summarizeTrainedModel(model));
+    })
+  );
+
+  // --- list_model_training_files ---
+  s.tool(
+    "list_model_training_files",
+    "List the training files attached to a specific trained model. Supports optional server-side search and pagination and returns normalized pagination metadata for MCP consumers.",
+    {
+      entityId: modelBasedEntityIdSchema,
+      modelId: trainedModelIdSchema,
+      search: entityFileSearchSchema,
+      offset: paginationOffsetSchema,
+      limit: paginationLimitSchema,
+    },
+    withLogging(logger, "list_model_training_files", async ({ entityId, modelId, search, offset, limit }) => {
+      const result = await client.listModelTrainingFiles(entityId, modelId, { search, offset, limit });
+      return jsonTextResult({
+        entityId,
+        modelId,
+        count: result.files.length,
+        totalCount: result.totalCount,
+        ...(typeof result.absoluteTotalCount === "number" ? { absoluteTotalCount: result.absoluteTotalCount } : {}),
+        ...(typeof result.totalPages === "number" ? { totalPages: result.totalPages } : {}),
+        ...(typeof result.search === "string" ? { search: result.search } : {}),
+        ...(typeof result.offset === "number" ? { offset: result.offset } : {}),
+        ...(typeof result.limit === "number" ? { limit: result.limit } : {}),
+        files: result.files.map((file) => summarizeModelTrainingFile(file)),
+      });
+    })
+  );
+
+  // --- get_model_training_file ---
+  s.tool(
+    "get_model_training_file",
+    "Get details for a specific trained-model training file, including the annotated content and spans when available.",
+    {
+      entityId: modelBasedEntityIdSchema,
+      modelId: trainedModelIdSchema,
+      fileId: modelBasedEntityFileIdSchema,
+    },
+    withLogging(logger, "get_model_training_file", async ({ entityId, modelId, fileId }) => {
+      const file = await client.getModelTrainingFile(entityId, modelId, fileId);
+      return jsonTextResult({
+        entityId,
+        modelId,
+        ...summarizeModelTrainingFileDetails(file),
+      });
+    })
+  );
+
+  // --- list_model_detected_entities ---
+  s.tool(
+    "list_model_detected_entities",
+    "List the most common detected entity values for a trained model. Supports optional server-side search and pagination and returns normalized pagination metadata for MCP consumers.",
+    {
+      entityId: modelBasedEntityIdSchema,
+      modelId: trainedModelIdSchema,
+      search: modelDetectedEntitySearchSchema,
+      offset: paginationOffsetSchema,
+      limit: paginationLimitSchema,
+    },
+    withLogging(logger, "list_model_detected_entities", async ({ entityId, modelId, search, offset, limit }) => {
+      const result = await client.listModelDetectedEntities(entityId, modelId, { search, offset, limit });
+      return jsonTextResult({
+        entityId,
+        modelId,
+        count: result.entities.length,
+        totalCount: result.totalCount,
+        ...(typeof result.search === "string" ? { search: result.search } : {}),
+        ...(typeof result.offset === "number" ? { offset: result.offset } : {}),
+        ...(typeof result.limit === "number" ? { limit: result.limit } : {}),
+        entities: result.entities.map((entity) => summarizeModelDetectedEntity(entity)),
+      });
+    })
+  );
+
+  // --- start_model_training ---
+  s.tool(
+    "start_model_training",
+    "Start training a trained model. This begins an asynchronous operation and returns immediately with the current status; it does not wait for training to finish.",
+    {
+      entityId: modelBasedEntityIdSchema,
+      modelId: trainedModelIdSchema,
+    },
+    withLogging(logger, "start_model_training", async ({ entityId, modelId }) => {
+      const result = await client.startModelTraining(entityId, modelId);
+      return jsonTextResult(summarizeAsyncModelAction("training_started", entityId, modelId, result));
+    })
+  );
+
+  // --- activate_trained_model ---
+  s.tool(
+    "activate_trained_model",
+    "Activate a trained model for an entity. This request returns immediately and does not wait for activation propagation to complete.",
+    {
+      entityId: modelBasedEntityIdSchema,
+      modelId: trainedModelIdSchema,
+    },
+    withLogging(logger, "activate_trained_model", async ({ entityId, modelId }) => {
+      const result = await client.activateTrainedModel(entityId, modelId);
+      return jsonTextResult(summarizeAsyncModelAction("activation_requested", entityId, modelId, result));
+    })
+  );
+
+  // --- get_entity_version ---
+  s.tool(
+    "get_entity_version",
+    "Get details for a specific entity version, including status, guidelines, metrics, and per-file summaries.",
+    {
+      entityId: modelBasedEntityIdSchema,
+      versionId: modelBasedEntityVersionIdSchema,
+    },
+    withLogging(logger, "get_entity_version", async ({ entityId, versionId }) => {
+      const version = await client.getEntityVersion(entityId, versionId);
+      return jsonTextResult(summarizeEntityVersion(version, { includeGuidelines: true, includeFiles: true }));
+    })
+  );
+
+  // --- upload_entity_test_file ---
+  s.tool(
+    "upload_entity_test_file",
+    "Upload a local test/review file for a model-based entity. The file must already exist on disk; Textual analyzes it asynchronously for version review workflows.",
+    {
+      entityId: modelBasedEntityIdSchema,
+      filePath: z.string().describe("Absolute path to the local file to upload"),
+    },
+    withLogging(logger, "upload_entity_test_file", async ({ entityId, filePath }) => {
+      if (!fs.existsSync(filePath)) {
+        return { content: [{ type: "text" as const, text: `Error: File not found: ${filePath}` }], isError: true };
+      }
+
+      const file = await client.uploadEntityTestFile(entityId, filePath);
+      return jsonTextResult({
+        ...summarizeEntityTestFile(entityId, file),
+        message: "Entity test file uploaded.",
+      });
+    })
+  );
+
+  // --- list_entity_test_files ---
+  s.tool(
+    "list_entity_test_files",
+    "List the test/review files attached to a model-based entity, including their annotation/review status and minimum eligible version.",
+    {
+      entityId: modelBasedEntityIdSchema,
+    },
+    withLogging(logger, "list_entity_test_files", async ({ entityId }) => {
+      const files = await client.listEntityTestFiles(entityId);
+      return jsonTextResult({
+        entityId,
+        count: files.length,
+        files: files.map((file) => summarizeEntityTestFile(entityId, file)),
+      });
+    })
+  );
+
+  // --- delete_entity_test_file ---
+  s.tool(
+    "delete_entity_test_file",
+    "Delete a model-based entity test/review file so it is excluded from future review workflows. Returns the immediate API response without waiting for any downstream processing.",
+    {
+      entityId: modelBasedEntityIdSchema,
+      fileId: modelBasedEntityFileIdSchema,
+    },
+    withLogging(logger, "delete_entity_test_file", async ({ entityId, fileId }) => {
+      const result = await client.deleteEntityTestFile(entityId, fileId);
+      return jsonTextResult(summarizeEntityTestFileDeletion(entityId, fileId, result));
+    })
+  );
+
+  // --- save_entity_ground_truth ---
+  s.tool(
+    "save_entity_ground_truth",
+    "Save reviewed ground-truth annotation spans for a model-based entity test file. Spans use start/end character offsets into the file content and can optionally mark the file as reviewed.",
+    {
+      entityId: modelBasedEntityIdSchema,
+      fileId: modelBasedEntityFileIdSchema,
+      annotations: z.array(modelBasedEntityAnnotationSpanSchema).describe("Ground-truth annotation spans for the file"),
+      markAsReviewed: z.boolean().describe("Whether to mark the file review as complete after saving the annotations"),
+    },
+    withLogging(logger, "save_entity_ground_truth", async ({ entityId, fileId, annotations, markAsReviewed }) => {
+      const file = await client.saveEntityGroundTruth(
+        entityId,
+        fileId,
+        annotations as ModelBasedEntityAnnotationSpan[],
+        markAsReviewed
+      );
+      return jsonTextResult(summarizeSavedGroundTruth(entityId, fileId, file));
+    })
+  );
+
+  // --- upload_entity_training_file ---
+  s.tool(
+    "upload_entity_training_file",
+    "Upload a local training file for a model-based entity. The file must already exist on disk; Textual analyzes it asynchronously before it can be used for model training.",
+    {
+      entityId: modelBasedEntityIdSchema,
+      filePath: z.string().describe("Absolute path to the local file to upload"),
+    },
+    withLogging(logger, "upload_entity_training_file", async ({ entityId, filePath }) => {
+      if (!fs.existsSync(filePath)) {
+        return { content: [{ type: "text" as const, text: `Error: File not found: ${filePath}` }], isError: true };
+      }
+
+      const file = await client.uploadEntityTrainingFile(entityId, filePath);
+      return jsonTextResult({
+        ...summarizeEntityTrainingFile(file),
+        message: "Entity training file uploaded.",
+      });
+    })
+  );
+
+  // --- list_entity_training_files ---
+  s.tool(
+    "list_entity_training_files",
+    "List the training files for a model-based entity. Supports optional server-side search and pagination, and returns normalized pagination metadata for MCP consumers.",
+    {
+      entityId: modelBasedEntityIdSchema,
+      search: entityFileSearchSchema,
+      offset: paginationOffsetSchema,
+      limit: paginationLimitSchema,
+    },
+    withLogging(logger, "list_entity_training_files", async ({ entityId, search, offset, limit }) => {
+      const result = await client.listEntityTrainingFiles(entityId, { search, offset, limit });
+      return jsonTextResult({
+        entityId,
+        count: result.files.length,
+        totalCount: result.totalCount,
+        ...(typeof result.search === "string" ? { search: result.search } : {}),
+        ...(typeof result.offset === "number" ? { offset: result.offset } : {}),
+        ...(typeof result.limit === "number" ? { limit: result.limit } : {}),
+        files: result.files.map((file) => summarizeEntityTrainingFile(file)),
+      });
+    })
+  );
+
+  // --- get_entity_training_file ---
+  s.tool(
+    "get_entity_training_file",
+    "Get details for a specific model-based entity training file, including the stored content when available.",
+    {
+      entityId: modelBasedEntityIdSchema,
+      fileId: modelBasedEntityFileIdSchema,
+    },
+    withLogging(logger, "get_entity_training_file", async ({ entityId, fileId }) => {
+      const file = await client.getEntityTrainingFile(entityId, fileId);
+      return jsonTextResult(summarizeEntityTrainingFileDetails(file));
+    })
+  );
+
+  // --- delete_entity_training_file ---
+  s.tool(
+    "delete_entity_training_file",
+    "Delete a model-based entity training file so it is excluded from future model creation/training runs. Returns the immediate API response without waiting for downstream processing.",
+    {
+      entityId: modelBasedEntityIdSchema,
+      fileId: modelBasedEntityFileIdSchema,
+    },
+    withLogging(logger, "delete_entity_training_file", async ({ entityId, fileId }) => {
+      const result = await client.deleteEntityTrainingFile(entityId, fileId);
+      return jsonTextResult(summarizeEntityTrainingFileDeletion(entityId, fileId, result));
+    })
+  );
+
+  // --- get_entity_file_annotations ---
+  s.tool(
+    "get_entity_file_annotations",
+    "Get annotation details for a specific entity-version file, including content, annotation spans, metrics, and review status. If versionId is omitted, the latest available entity version is used.",
+    {
+      entityId: modelBasedEntityIdSchema,
+      versionId: modelBasedEntityVersionIdSchema.optional().describe("Optional entity version ID. If omitted, the latest available entity version is used."),
+      fileId: modelBasedEntityFileIdSchema,
+      forcePredictions: z.boolean().optional().describe("If true, force regeneration of predictions before returning file annotations"),
+    },
+    withLogging(logger, "get_entity_file_annotations", async ({ entityId, versionId, fileId, forcePredictions }) => {
+      const resolvedVersionId = versionId ?? await resolveLatestEntityVersionId(entityId);
+      const file = await client.getEntityFileAnnotations(entityId, resolvedVersionId, fileId, forcePredictions);
+      return jsonTextResult({
+        entityId,
+        ...summarizeEntityFileAnnotations(file),
+      });
+    })
+  );
+
+  // --- activate_entity_for_dataset ---
+  s.tool(
+    "activate_entity_for_dataset",
+    "Activate the current active model for a model-based entity on a dataset. This request returns immediately with entity/dataset identifiers and any available activation status.",
+    {
+      entityId: modelBasedEntityIdSchema,
+      datasetId: datasetIdSchema,
+    },
+    withLogging(logger, "activate_entity_for_dataset", async ({ entityId, datasetId }) => {
+      const result = await client.activateEntityForDataset(entityId, datasetId);
+      return jsonTextResult(summarizeEntityDatasetActivation(entityId, datasetId, result));
+    })
+  );
+
+  // --- deactivate_entity_for_dataset ---
+  s.tool(
+    "deactivate_entity_for_dataset",
+    "Deactivate a model-based entity for a dataset. This request returns immediately with entity/dataset identifiers and any available deactivation status.",
+    {
+      entityId: modelBasedEntityIdSchema,
+      datasetId: datasetIdSchema,
+    },
+    withLogging(logger, "deactivate_entity_for_dataset", async ({ entityId, datasetId }) => {
+      const result = await client.deactivateEntityForDataset(entityId, datasetId);
+      return jsonTextResult(summarizeEntityDatasetDeactivation(entityId, datasetId, result));
     })
   );
 
