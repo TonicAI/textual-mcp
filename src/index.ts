@@ -42,6 +42,11 @@ const POLL_INTERVAL_MS = 5000;
 const POLL_TIMEOUT_S = parseInt(process.env.TONIC_TEXTUAL_POLL_TIMEOUT_SECONDS || "900", 10);
 const SESSION_IDLE_TIMEOUT_MS = parseInt(process.env.TONIC_TEXTUAL_SESSION_IDLE_TIMEOUT_MS || `${30 * 60 * 1000}`, 10);
 const SESSION_JANITOR_INTERVAL_MS = 60 * 1000;
+// Local-files mode: when set, the server is treated as running on the
+// caller's machine (e.g. an `npm i -g` install next to Claude Desktop)
+// and may read/write the local filesystem. Default is hosted-mode where
+// only base64 payloads are accepted.
+const ALLOW_LOCAL_FILES = /^(1|true|yes|on)$/i.test(process.env.TONIC_TEXTUAL_ALLOW_LOCAL_FILES ?? "");
 
 // --- Shared schemas ---
 
@@ -60,18 +65,55 @@ const generatorDefaultSchema = generatorHandlingEnum
   .optional()
   .describe("Default handling for entity types not specified in generatorConfig");
 
-// Bytes-canonical file upload schema. The MCP server is hosted and has
-// no access to the caller's filesystem, so callers send file contents
-// inline. Local-files mode (TONIC_TEXTUAL_ALLOW_LOCAL_FILES) layers
-// optional path-based alternatives on top of these in a follow-up task.
-const uploadFilePayloadSchemas = {
-  fileName: z.string().describe("Name to record for the file (including extension)."),
-  mimeType: z
-    .string()
-    .optional()
-    .describe("MIME type of the file. If omitted, inferred from fileName extension."),
-  contentBase64: z.string().describe("File contents, base64-encoded."),
-} as const;
+// Bytes-canonical file upload schema. The MCP server is hosted by
+// default and has no access to the caller's filesystem, so callers send
+// file contents inline. When TONIC_TEXTUAL_ALLOW_LOCAL_FILES is set,
+// uploadFilePayloadSchemas() relaxes those fields and adds an optional
+// filePath alternative; resolveUploadPayload() picks whichever the
+// caller supplied.
+function uploadFilePayloadSchemas(allowLocal: boolean): Record<string, z.ZodTypeAny> {
+  if (!allowLocal) {
+    return {
+      fileName: z.string().describe("Name to record for the file (including extension)."),
+      mimeType: z
+        .string()
+        .optional()
+        .describe("MIME type of the file. If omitted, inferred from fileName extension."),
+      contentBase64: z.string().describe("File contents, base64-encoded."),
+    };
+  }
+  return {
+    fileName: z
+      .string()
+      .optional()
+      .describe("Name to record for the file (including extension). Required when uploading inline contents; ignored when filePath is provided."),
+    mimeType: z
+      .string()
+      .optional()
+      .describe("MIME type of the file. If omitted, inferred from fileName/filePath extension."),
+    contentBase64: z
+      .string()
+      .optional()
+      .describe("File contents, base64-encoded. Mutually exclusive with filePath."),
+    filePath: z
+      .string()
+      .optional()
+      .describe("Local-install only: absolute path to the file to upload. Mutually exclusive with contentBase64."),
+  };
+}
+
+function downloadOutputPathSchema(allowLocal: boolean): Record<string, z.ZodTypeAny> {
+  return allowLocal
+    ? {
+        outputPath: z
+          .string()
+          .optional()
+          .describe(
+            "Local-install only: absolute path to write the redacted file to. When provided, returns the saved path instead of inline base64."
+          ),
+      }
+    : {};
+}
 
 function decodeUploadPayload(input: {
   fileName: string;
@@ -120,6 +162,58 @@ function encodeBytesPayload(buffer: Buffer, fileName: string, mimeType?: string)
     bytes: buffer.length,
     contentBase64: buffer.toString("base64"),
   };
+}
+
+// Loose params shape used by all upload-bearing tool handlers. TypeScript
+// can't infer the shape across the conditional uploadFilePayloadSchemas
+// helper, so handlers cast their incoming params to this and rely on
+// resolveUploadPayload to enforce per-mode validation at runtime.
+type UploadToolParams = {
+  fileName?: string;
+  mimeType?: string;
+  contentBase64?: string;
+  filePath?: string;
+};
+
+type DownloadOutputParams = { outputPath?: string };
+
+function resolveUploadPayload(
+  input: UploadToolParams,
+  allowLocal: boolean
+): UploadFilePayload {
+  if (input.filePath) {
+    if (!allowLocal) {
+      throw new Error(
+        "filePath is not supported on this server. Set TONIC_TEXTUAL_ALLOW_LOCAL_FILES=true to enable local-install mode, or supply contentBase64 instead."
+      );
+    }
+    if (input.contentBase64) {
+      throw new Error("Provide either filePath or contentBase64, not both.");
+    }
+    const payload = loadLocalFilePayload(input.filePath);
+    if (input.mimeType?.trim()) payload.mimeType = input.mimeType.trim();
+    if (input.fileName?.trim()) payload.fileName = input.fileName.trim();
+    return payload;
+  }
+  if (!input.fileName) {
+    throw new Error("fileName is required when uploading inline contents.");
+  }
+  if (!input.contentBase64) {
+    throw new Error("contentBase64 is required when uploading inline contents.");
+  }
+  return decodeUploadPayload({
+    fileName: input.fileName,
+    mimeType: input.mimeType,
+    contentBase64: input.contentBase64,
+  });
+}
+
+function writeLocalOutput(buffer: Buffer, outputPath: string): { savedTo: string; bytes: number } {
+  const resolved = path.resolve(outputPath);
+  const dir = path.dirname(resolved);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(resolved, buffer);
+  return { savedTo: resolved, bytes: buffer.length };
 }
 
 const labelCustomListSchema = z.object({
@@ -755,7 +849,7 @@ type Profile = "light" | "full";
 // ============================================================
 // Register all tools on an McpServer instance
 // ============================================================
-function registerTools(s: McpServer, client: TextualClient, profile: Profile) {
+function registerTools(s: McpServer, client: TextualClient, profile: Profile, allowLocalFiles: boolean) {
   // Tools that only belong to the full profile are registered through this
   // helper so the light profile (curated model-based-entity workflow) does
   // not surface them. Keeps the diff minimal versus wrapping each tool in
@@ -763,6 +857,14 @@ function registerTools(s: McpServer, client: TextualClient, profile: Profile) {
   const registerFull = (fn: () => void): void => {
     if (profile === "full") fn();
   };
+  // Tools that only make sense when the server can read/write the
+  // caller's local filesystem (local-install mode). They are also FULL-only
+  // by virtue of being wrapped in registerFull at the call site.
+  const registerLocal = (fn: () => void): void => {
+    if (allowLocalFiles) fn();
+  };
+  const uploadSchemas = uploadFilePayloadSchemas(allowLocalFiles);
+  const downloadOutputSchema = downloadOutputPathSchema(allowLocalFiles);
 
   // --- redact_text ---
   registerFull(() => s.tool(
@@ -883,19 +985,20 @@ Do NOT use this for text-based files (.txt, .json, .xml, .html, .htm, .csv, .tsv
 
 Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
       inputSchema: {
-        ...uploadFilePayloadSchemas,
+        ...uploadSchemas,
         ...redactOptionSchemas,
       },
       execution: { taskSupport: "optional" as const },
     },
     {
       createTask: async (params, extra) => {
-        logger.logToolCall("redact_file", { fileName: params.fileName, mimeType: params.mimeType });
-        const payload = decodeUploadPayload({
-          fileName: params.fileName,
-          mimeType: params.mimeType,
-          contentBase64: params.contentBase64,
+        const upload = params as UploadToolParams;
+        logger.logToolCall("redact_file", {
+          fileName: upload.fileName,
+          mimeType: upload.mimeType,
+          ...(allowLocalFiles && upload.filePath ? { filePath: upload.filePath } : {}),
         });
+        const payload = resolveUploadPayload(upload, allowLocalFiles);
         const ext = path.extname(payload.fileName).toLowerCase();
         const textTypes = [".txt", ".json", ".html", ".htm", ".xml", ".csv", ".tsv"];
         if (textTypes.includes(ext)) {
@@ -979,6 +1082,7 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
     {
       jobId: z.string().describe("The job ID of a completed file redaction job"),
       fileName: z.string().optional().describe("Optional file name to label the response with. If omitted, falls back to the job's recorded fileName, then jobId."),
+      ...downloadOutputSchema,
       ...redactOptionSchemas,
     },
     withLogging(logger, "download_redacted_file", async (params, extra) => {
@@ -994,7 +1098,13 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
           // ignore — fall back to jobId
         }
       }
-      return jsonTextResult(encodeBytesPayload(buffer, resolvedFileName ?? params.jobId));
+      const labelName = resolvedFileName ?? params.jobId;
+      const outputPath = (params as unknown as DownloadOutputParams).outputPath;
+      if (allowLocalFiles && outputPath) {
+        const { savedTo, bytes } = writeLocalOutput(buffer, outputPath);
+        return jsonTextResult({ fileName: labelName, savedTo, bytes });
+      }
+      return jsonTextResult(encodeBytesPayload(buffer, labelName));
     })
   ));
 
@@ -1052,9 +1162,10 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
   registerFull(() => s.tool(
     "upload_file_to_dataset",
     "Upload a file to an existing Tonic Textual dataset for scanning and redaction. The file contents are sent inline as base64; no server-side filesystem access is required.",
-    { datasetId: z.string().describe("The dataset ID to upload to"), ...uploadFilePayloadSchemas },
-    withLogging(logger, "upload_file_to_dataset", async ({ datasetId, fileName, mimeType, contentBase64 }) => {
-      const payload = decodeUploadPayload({ fileName, mimeType, contentBase64 });
+    { datasetId: z.string().describe("The dataset ID to upload to"), ...uploadSchemas },
+    withLogging(logger, "upload_file_to_dataset", async (params) => {
+      const { datasetId } = params;
+      const payload = resolveUploadPayload(params as unknown as UploadToolParams, allowLocalFiles);
       const upload = await client.uploadFileToDataset(datasetId, payload);
       const file = upload.uploadedFile;
       return {
@@ -1079,10 +1190,18 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
       datasetId: z.string().describe("The dataset ID"),
       fileId: z.string().describe("The file ID within the dataset"),
       fileName: z.string().optional().describe("Optional file name to label the response with. If omitted, falls back to fileId."),
+      ...downloadOutputSchema,
     },
-    withLogging(logger, "download_dataset_file", async ({ datasetId, fileId, fileName }) => {
+    withLogging(logger, "download_dataset_file", async (params) => {
+      const { datasetId, fileId, fileName } = params;
       const buffer = await client.downloadDatasetFile(datasetId, fileId);
-      return jsonTextResult(encodeBytesPayload(buffer, fileName ?? fileId));
+      const labelName = fileName ?? fileId;
+      const outputPath = (params as unknown as DownloadOutputParams).outputPath;
+      if (allowLocalFiles && outputPath) {
+        const { savedTo, bytes } = writeLocalOutput(buffer, outputPath);
+        return jsonTextResult({ fileName: labelName, savedTo, bytes });
+      }
+      return jsonTextResult(encodeBytesPayload(buffer, labelName));
     })
   ));
 
@@ -1494,10 +1613,11 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
     "Upload a test/review file for a model-based entity. The file contents are sent inline as base64; Textual analyzes the file asynchronously for version review workflows.",
     {
       entityId: modelBasedEntityIdSchema,
-      ...uploadFilePayloadSchemas,
+      ...uploadSchemas,
     },
-    withLogging(logger, "upload_entity_test_file", async ({ entityId, fileName, mimeType, contentBase64 }) => {
-      const payload = decodeUploadPayload({ fileName, mimeType, contentBase64 });
+    withLogging(logger, "upload_entity_test_file", async (params) => {
+      const { entityId } = params;
+      const payload = resolveUploadPayload(params as unknown as UploadToolParams, allowLocalFiles);
       const file = await client.uploadEntityTestFile(entityId, payload);
       return jsonTextResult({
         ...summarizeEntityTestFile(entityId, file),
@@ -1564,10 +1684,11 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
     "Upload a training file for a model-based entity. The file contents are sent inline as base64; Textual analyzes the file asynchronously before it can be used for model training.",
     {
       entityId: modelBasedEntityIdSchema,
-      ...uploadFilePayloadSchemas,
+      ...uploadSchemas,
     },
-    withLogging(logger, "upload_entity_training_file", async ({ entityId, fileName, mimeType, contentBase64 }) => {
-      const payload = decodeUploadPayload({ fileName, mimeType, contentBase64 });
+    withLogging(logger, "upload_entity_training_file", async (params) => {
+      const { entityId } = params;
+      const payload = resolveUploadPayload(params as unknown as UploadToolParams, allowLocalFiles);
       const file = await client.uploadEntityTrainingFile(entityId, payload);
       return jsonTextResult({
         ...summarizeEntityTrainingFile(file),
@@ -1698,8 +1819,8 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
     })
   );
 
-  // --- scan_directory ---
-  registerFull(() => s.tool(
+  // --- scan_directory (local-files mode only) ---
+  registerFull(() => registerLocal(() => s.tool(
     "scan_directory",
     "Scan a local directory tree and return an inventory of all files with their types and sizes. Use this to understand the structure before de-identifying.",
     {
@@ -1748,10 +1869,10 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
         }],
       };
     })
-  ));
+  )));
 
-  // --- deidentify_folder ---
-  registerFull(() => s.tool(
+  // --- deidentify_folder (local-files mode only) ---
+  registerFull(() => registerLocal(() => s.tool(
     "deidentify_folder",
     `De-identify an entire folder tree in a single call. This is the PREFERRED tool whenever the user wants to redact, de-identify, or anonymize multiple files or a directory. Do NOT loop over files calling redact_text/redact_file individually, and do NOT write scripts to batch-process files — use this tool instead.
 
@@ -1989,7 +2110,7 @@ Recommended workflow: use scan_directory to preview, test redact_text/redact_jso
         }],
       };
     })
-  ));
+  )));
 }
 
 // ============================================================
@@ -2043,7 +2164,7 @@ async function main() {
       taskStore: new InMemoryTaskStore(),
     });
     const client = new TextualClient(BASE_URL, apiKey, logger, MAX_CONCURRENT);
-    registerTools(server, client, profile);
+    registerTools(server, client, profile, ALLOW_LOCAL_FILES);
     const now = Date.now();
     // Forward-declare the session so the SDK callbacks below can capture it
     // by reference; sessionId is assigned by the transport during the
@@ -2166,7 +2287,11 @@ async function main() {
   });
 
   httpServer.listen(port, () => {
-    logger.info("Tonic Textual MCP server running on HTTP", { port, endpoints: ["/mcp", "/mcp/light"] });
+    logger.info("Tonic Textual MCP server running on HTTP", {
+      port,
+      endpoints: ["/mcp", "/mcp/light"],
+      allowLocalFiles: ALLOW_LOCAL_FILES,
+    });
   });
 }
 
