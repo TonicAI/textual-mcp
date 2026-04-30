@@ -34,18 +34,13 @@ import {
 import { Logger, withLogging } from "./logger.js";
 
 const BASE_URL = process.env.TONIC_TEXTUAL_BASE_URL || "https://textual.tonic.ai";
-const API_KEY = process.env.TONIC_TEXTUAL_API_KEY;
-
-if (!API_KEY) {
-  console.error("TONIC_TEXTUAL_API_KEY environment variable is required");
-  process.exit(1);
-}
 
 const logger = new Logger();
 const MAX_CONCURRENT = parseInt(process.env.TONIC_TEXTUAL_MAX_CONCURRENT_REQUESTS || "50", 10);
 const POLL_INTERVAL_MS = 5000;
 const POLL_TIMEOUT_S = parseInt(process.env.TONIC_TEXTUAL_POLL_TIMEOUT_SECONDS || "900", 10);
-const client = new TextualClient(BASE_URL, API_KEY, logger, MAX_CONCURRENT);
+const SESSION_IDLE_TIMEOUT_MS = parseInt(process.env.TONIC_TEXTUAL_SESSION_IDLE_TIMEOUT_MS || `${30 * 60 * 1000}`, 10);
+const SESSION_JANITOR_INTERVAL_MS = 60 * 1000;
 
 // --- Shared schemas ---
 
@@ -425,7 +420,7 @@ function summarizeEntityFileAnnotations(file: ModelBasedEntityFileVersionRecordW
   };
 }
 
-async function resolveLatestEntityVersionId(entityId: string): Promise<string> {
+async function resolveLatestEntityVersionId(client: TextualClient, entityId: string): Promise<string> {
   const versions = await client.listEntityVersions(entityId);
   const latestVersion = versions.reduce<ModelBasedEntityVersionApiModel | null>((currentLatest, version) => {
     if (!currentLatest || version.versionNumber > currentLatest.versionNumber) {
@@ -665,7 +660,7 @@ function toTimeSpan(input: string): string {
 }
 
 // Helper: poll for file processing completion then download
-async function pollAndDownload(jobId: string, opts: RedactOptions, signal?: AbortSignal): Promise<Buffer> {
+async function pollAndDownload(client: TextualClient, jobId: string, opts: RedactOptions, signal?: AbortSignal): Promise<Buffer> {
   const maxAttempts = Math.ceil(POLL_TIMEOUT_S / (POLL_INTERVAL_MS / 1000));
   for (let i = 0; i < maxAttempts; i++) {
     signal?.throwIfAborted();
@@ -687,7 +682,7 @@ async function pollAndDownload(jobId: string, opts: RedactOptions, signal?: Abor
 // ============================================================
 // Register all tools on an McpServer instance
 // ============================================================
-function registerTools(s: McpServer) {
+function registerTools(s: McpServer, client: TextualClient) {
 
   // --- redact_text ---
   s.tool(
@@ -836,7 +831,7 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
         // Background: poll for completion, download, save
         (async () => {
           try {
-            const buffer = await pollAndDownload(job.jobId, opts);
+            const buffer = await pollAndDownload(client, job.jobId, opts);
             const dir = path.dirname(params.outputPath);
             if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
             fs.writeFileSync(params.outputPath, buffer);
@@ -1566,7 +1561,7 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
       forcePredictions: z.boolean().optional().describe("If true, force regeneration of predictions before returning file annotations"),
     },
     withLogging(logger, "get_entity_file_annotations", async ({ entityId, versionId, fileId, forcePredictions }) => {
-      const resolvedVersionId = versionId ?? await resolveLatestEntityVersionId(entityId);
+      const resolvedVersionId = versionId ?? await resolveLatestEntityVersionId(client, entityId);
       const file = await client.getEntityFileAnnotations(entityId, resolvedVersionId, fileId, forcePredictions);
       return jsonTextResult({
         entityId,
@@ -1844,7 +1839,7 @@ Recommended workflow: use scan_directory to preview, test redact_text/redact_jso
         const binaryPromises = binaryJobs.map(({ item, jobId }) => {
           if (signal?.aborted) return Promise.resolve();
           const dlStart = Date.now();
-          return pollAndDownload(jobId, opts, signal).then((redactedBuf) => {
+          return pollAndDownload(client, jobId, opts, signal).then((redactedBuf) => {
             fs.mkdirSync(path.dirname(item.outFilePath), { recursive: true });
             fs.writeFileSync(item.outFilePath, redactedBuf);
             logger.info("file_redact_complete", { tool: "deidentify_folder", file: item.relPath, outputBytes: redactedBuf.length, durationMs: Date.now() - dlStart });
@@ -1900,27 +1895,103 @@ Recommended workflow: use scan_directory to preview, test redact_text/redact_jso
 // ============================================================
 // Start the server
 // ============================================================
+
+interface Session {
+  server: McpServer;
+  transport: StreamableHTTPServerTransport;
+  client: TextualClient;
+  createdAt: number;
+  lastUsedAt: number;
+}
+
+// Extract the API key from the Authorization header. Supports both raw
+// `Authorization: <key>` (matches Solar's ApiKeyAuthHandler) and
+// `Authorization: Bearer <key>`. Returns null when missing or empty.
+function extractApiKey(req: { headers: NodeJS.Dict<string | string[]> }): string | null {
+  const raw = req.headers["authorization"];
+  const header = Array.isArray(raw) ? raw[0] : raw;
+  if (!header) return null;
+  const trimmed = header.trim();
+  if (!trimmed) return null;
+  const match = trimmed.match(/^Bearer\s+(.+)$/i);
+  const value = match ? match[1].trim() : trimmed;
+  return value.length > 0 ? value : null;
+}
+
+function writeJsonRpcError(
+  res: import("node:http").ServerResponse,
+  status: number,
+  code: number,
+  message: string
+): void {
+  if (res.headersSent) return;
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ jsonrpc: "2.0", error: { code, message }, id: null }));
+}
+
 async function main() {
   const port = parseInt(process.env.PORT || "3000", 10);
 
-  // Each session gets its own McpServer + Transport pair so that
-  // in-flight request state, abort controllers, and response handlers
-  // are fully isolated between sessions.
-  let currentSession: {
-    server: McpServer;
-    transport: StreamableHTTPServerTransport;
-  } | null = null;
+  // Each session gets its own McpServer + Transport + TextualClient so that
+  // in-flight request state, abort controllers, response handlers, and the
+  // caller's API credential are fully isolated between sessions.
+  const sessions = new Map<string, Session>();
 
-  function createSession(): { server: McpServer; transport: StreamableHTTPServerTransport } {
+  function createSession(apiKey: string): Session {
     const server = new McpServer({ name: "tonic-textual", version: "1.0.0" }, {
       taskStore: new InMemoryTaskStore(),
     });
-    registerTools(server);
+    const client = new TextualClient(BASE_URL, apiKey, logger, MAX_CONCURRENT);
+    registerTools(server, client);
+    const now = Date.now();
+    // Forward-declare the session so the SDK callbacks below can capture it
+    // by reference; sessionId is assigned by the transport during the
+    // initialize request via onsessioninitialized.
+    const session: Session = {
+      server,
+      transport: undefined as unknown as StreamableHTTPServerTransport,
+      client,
+      createdAt: now,
+      lastUsedAt: now,
+    };
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
+      onsessioninitialized: (sid: string) => {
+        sessions.set(sid, session);
+        logger.info("session_established", { sessionId: sid, totalSessions: sessions.size });
+      },
     });
-    return { server, transport };
+    transport.onclose = () => {
+      const sid = transport.sessionId;
+      if (sid && sessions.delete(sid)) {
+        logger.info("session_closed", { sessionId: sid, totalSessions: sessions.size });
+      }
+    };
+    session.transport = transport;
+    return session;
   }
+
+  async function initializeSession(apiKey: string): Promise<Session> {
+    const session = createSession(apiKey);
+    await session.server.connect(session.transport);
+    return session;
+  }
+
+  // Idle-session janitor: evict sessions that have not been used recently so
+  // we don't retain caller credentials in memory longer than necessary.
+  const janitor = setInterval(() => {
+    const now = Date.now();
+    for (const [sid, session] of sessions) {
+      if (now - session.lastUsedAt > SESSION_IDLE_TIMEOUT_MS) {
+        logger.info("session_evicted_idle", { sessionId: sid, idleMs: now - session.lastUsedAt });
+        session.server.close().catch((err) => {
+          logger.error("session_evict_close_error", { sessionId: sid, error: String(err) });
+        });
+        sessions.delete(sid);
+      }
+    }
+  }, SESSION_JANITOR_INTERVAL_MS);
+  janitor.unref();
 
   const httpServer = createServer(async (req, res) => {
     const url = new URL(req.url || "/", `http://localhost:${port}`);
@@ -1930,44 +2001,42 @@ async function main() {
     if (url.pathname === "/mcp") {
       try {
         // Route to existing session if session ID matches
-        if (sessionId && currentSession?.transport.sessionId === sessionId) {
-          await currentSession.transport.handleRequest(req, res);
-          return;
+        if (sessionId) {
+          const existing = sessions.get(sessionId);
+          if (existing) {
+            existing.lastUsedAt = Date.now();
+            await existing.transport.handleRequest(req, res);
+            return;
+          }
         }
 
-        // New initialization: POST without session header
-        if (req.method === "POST" && !sessionId) {
-          logger.info("new_session", { reason: "POST without session header" });
-          if (currentSession) {
-            logger.info("closing_previous_session", { previousSessionId: currentSession.transport.sessionId });
-            await currentSession.server.close();
+        // New initialization or reconnect on a stale session ID. Both require
+        // the Authorization header so we can build a per-session client.
+        if (req.method === "POST") {
+          const apiKey = extractApiKey(req);
+          if (!apiKey) {
+            logger.info("session_init_unauthorized", { reason: "Missing Authorization header" });
+            writeJsonRpcError(
+              res,
+              401,
+              -32001,
+              "Missing Authorization header. Provide a Solar API key via 'Authorization: <api-key>'."
+            );
+            return;
           }
-          const session = createSession();
-          await session.server.connect(session.transport);
-          currentSession = session;
-          await session.transport.handleRequest(req, res);
-          logger.info("session_established", { sessionId: session.transport.sessionId });
-          return;
-        }
-
-        // Stale session ID on POST — client's session expired, create a new one
-        if (req.method === "POST" && sessionId) {
-          logger.info("session_expired_reconnect", { expiredSessionId: sessionId });
-          if (currentSession) {
-            await currentSession.server.close();
+          if (sessionId) {
+            logger.info("session_expired_reconnect", { expiredSessionId: sessionId });
+          } else {
+            logger.info("new_session", { reason: "POST without session header" });
           }
-          const session = createSession();
-          await session.server.connect(session.transport);
-          currentSession = session;
+          const session = await initializeSession(apiKey);
           await session.transport.handleRequest(req, res);
-          logger.info("session_established", { sessionId: session.transport.sessionId });
           return;
         }
 
         // GET/DELETE with unknown session — nothing to reconnect to
-        logger.info("session_not_found", { method: req.method, sessionId: sessionId || null, currentSessionId: currentSession?.transport.sessionId || null });
-        res.writeHead(404, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32001, message: "Session not found" }, id: null }));
+        logger.info("session_not_found", { method: req.method, sessionId: sessionId || null });
+        writeJsonRpcError(res, 404, -32001, "Session not found");
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         const stack = err instanceof Error ? err.stack : undefined;
@@ -1979,7 +2048,7 @@ async function main() {
       }
     } else if (url.pathname === "/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok" }));
+      res.end(JSON.stringify({ status: "ok", sessions: sessions.size }));
     } else {
       logger.info("http_not_found", { method: req.method, path: url.pathname });
       res.writeHead(404, { "Content-Type": "application/json" });
