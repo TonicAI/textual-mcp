@@ -30,6 +30,7 @@ import {
   type ModelBasedEntityTrainedModelApiModel,
   type ModelBasedEntityVersionApiModel,
   type RedactOptions,
+  type UploadFilePayload,
 } from "./textual-client.js";
 import { Logger, withLogging } from "./logger.js";
 
@@ -58,6 +59,68 @@ const generatorConfigSchema = z
 const generatorDefaultSchema = generatorHandlingEnum
   .optional()
   .describe("Default handling for entity types not specified in generatorConfig");
+
+// Bytes-canonical file upload schema. The MCP server is hosted and has
+// no access to the caller's filesystem, so callers send file contents
+// inline. Local-files mode (TONIC_TEXTUAL_ALLOW_LOCAL_FILES) layers
+// optional path-based alternatives on top of these in a follow-up task.
+const uploadFilePayloadSchemas = {
+  fileName: z.string().describe("Name to record for the file (including extension)."),
+  mimeType: z
+    .string()
+    .optional()
+    .describe("MIME type of the file. If omitted, inferred from fileName extension."),
+  contentBase64: z.string().describe("File contents, base64-encoded."),
+} as const;
+
+function decodeUploadPayload(input: {
+  fileName: string;
+  mimeType?: string;
+  contentBase64: string;
+}): UploadFilePayload {
+  let content: Buffer;
+  try {
+    content = Buffer.from(input.contentBase64, "base64");
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`Invalid contentBase64: ${msg}`);
+  }
+  if (content.length === 0) {
+    throw new Error("contentBase64 decoded to zero bytes; provide non-empty file contents.");
+  }
+  const mimeType = input.mimeType?.trim() || lookup(input.fileName) || "application/octet-stream";
+  return { fileName: input.fileName, mimeType, content };
+}
+
+function loadLocalFilePayload(filePath: string): UploadFilePayload {
+  const resolved = path.resolve(filePath);
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`File not found: ${resolved}`);
+  }
+  const stats = fs.statSync(resolved);
+  if (!stats.isFile()) {
+    throw new Error(`Path is not a file: ${resolved}`);
+  }
+  return {
+    fileName: path.basename(resolved),
+    mimeType: lookup(resolved) || "application/octet-stream",
+    content: fs.readFileSync(resolved),
+  };
+}
+
+function encodeBytesPayload(buffer: Buffer, fileName: string, mimeType?: string): {
+  fileName: string;
+  mimeType: string;
+  bytes: number;
+  contentBase64: string;
+} {
+  return {
+    fileName,
+    mimeType: mimeType || lookup(fileName) || "application/octet-stream",
+    bytes: buffer.length,
+    contentBase64: buffer.toString("base64"),
+  };
+}
 
 const labelCustomListSchema = z.object({
   strings: z.array(z.string()).optional().describe("Literal strings to match"),
@@ -814,47 +877,46 @@ function registerTools(s: McpServer, client: TextualClient, profile: Profile) {
   registerFull(() => s.experimental.tasks.registerToolTask(
     "redact_file",
     {
-      description: `Redact PII from a single binary file (PDF, docx, xlsx, images). Uploads the file to Textual and processes in the background — does NOT block while waiting.
+      description: `Redact PII from a single binary file (PDF, docx, xlsx, images). The file contents are sent inline as base64; Textual processes them in the background and the redacted bytes are returned in the task completion payload — this call does NOT block waiting for completion.
 
 Do NOT use this for text-based files (.txt, .json, .xml, .html, .htm, .csv, .tsv). Use redact_text, redact_json, redact_xml, or redact_html instead — they are faster and return inline results.
 
-IMPORTANT: If you need to redact multiple files or an entire directory, use deidentify_folder instead — do NOT call this tool in a loop or write a script to iterate over files.
-
 Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
       inputSchema: {
-        filePath: z.string().describe("Absolute path to the file to redact"),
-        outputPath: z.string().describe("Absolute path where the redacted file should be saved"),
+        ...uploadFilePayloadSchemas,
         ...redactOptionSchemas,
       },
       execution: { taskSupport: "optional" as const },
     },
     {
       createTask: async (params, extra) => {
-        logger.logToolCall("redact_file", params as Record<string, unknown>);
-        if (!fs.existsSync(params.filePath)) {
-          throw new Error(`File not found: ${params.filePath}`);
-        }
-        const ext = path.extname(params.filePath).toLowerCase();
+        logger.logToolCall("redact_file", { fileName: params.fileName, mimeType: params.mimeType });
+        const payload = decodeUploadPayload({
+          fileName: params.fileName,
+          mimeType: params.mimeType,
+          contentBase64: params.contentBase64,
+        });
+        const ext = path.extname(payload.fileName).toLowerCase();
         const textTypes = [".txt", ".json", ".html", ".htm", ".xml", ".csv", ".tsv"];
         if (textTypes.includes(ext)) {
           throw new Error(`${ext} files should be redacted using the text-based redaction tools (redact_text, redact_json, redact_xml, redact_html) which are faster and return inline results.`);
         }
 
-        const job = await client.startFileRedaction(params.filePath);
+        const job = await client.startFileRedaction(payload);
         const opts = buildRedactOpts(params);
         const task = await extra.taskStore.createTask({ ttl: (POLL_TIMEOUT_S + 60) * 1000, pollInterval: POLL_INTERVAL_MS });
-        logger.info("redact_file_task_created", { taskId: task.taskId, jobId: job.jobId, file: params.filePath });
+        logger.info("redact_file_task_created", { taskId: task.taskId, jobId: job.jobId, file: payload.fileName });
 
-        // Background: poll for completion, download, save
+        // Background: poll for completion, then store the redacted bytes in
+        // the task result. Hosted MCP servers can't write to the caller's
+        // disk, so the bytes ride back inline as base64.
         (async () => {
           try {
             const buffer = await pollAndDownload(client, job.jobId, opts);
-            const dir = path.dirname(params.outputPath);
-            if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-            fs.writeFileSync(params.outputPath, buffer);
-            logger.info("redact_file_task_complete", { taskId: task.taskId, outputPath: params.outputPath, bytes: buffer.length });
+            logger.info("redact_file_task_complete", { taskId: task.taskId, file: payload.fileName, bytes: buffer.length });
+            const result = encodeBytesPayload(buffer, payload.fileName, payload.mimeType);
             await extra.taskStore.storeTaskResult(task.taskId, "completed", {
-              content: [{ type: "text" as const, text: `Redacted file saved to: ${params.outputPath} (${buffer.length} bytes)` }],
+              content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
             });
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
@@ -913,20 +975,26 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
   // --- download_redacted_file ---
   registerFull(() => s.tool(
     "download_redacted_file",
-    "Download the redacted version of an unattached file job that has already been uploaded and processed. Use get_file_job or list_file_jobs to find the job ID. Only works for jobs with Completed status.",
+    "Download the redacted version of an unattached file job that has already been uploaded and processed. Use get_file_job or list_file_jobs to find the job ID. Only works for jobs with Completed status. Returns the file contents inline as base64.",
     {
       jobId: z.string().describe("The job ID of a completed file redaction job"),
-      outputPath: z.string().describe("Absolute path where the redacted file should be saved"),
+      fileName: z.string().optional().describe("Optional file name to label the response with. If omitted, falls back to the job's recorded fileName, then jobId."),
       ...redactOptionSchemas,
     },
     withLogging(logger, "download_redacted_file", async (params, extra) => {
       const signal: AbortSignal | undefined = extra?.signal;
       const opts = buildRedactOpts(params);
       const buffer = await client.downloadRedactedFile(params.jobId, opts, signal);
-      const dir = path.dirname(params.outputPath);
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(params.outputPath, buffer);
-      return { content: [{ type: "text" as const, text: `Redacted file saved to: ${params.outputPath} (${buffer.length} bytes)` }] };
+      let resolvedFileName = params.fileName?.trim();
+      if (!resolvedFileName) {
+        try {
+          const job = await client.getFileJob(params.jobId);
+          if (job?.fileName) resolvedFileName = job.fileName;
+        } catch {
+          // ignore — fall back to jobId
+        }
+      }
+      return jsonTextResult(encodeBytesPayload(buffer, resolvedFileName ?? params.jobId));
     })
   ));
 
@@ -983,20 +1051,18 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
   // --- upload_file_to_dataset ---
   registerFull(() => s.tool(
     "upload_file_to_dataset",
-    "Upload a file to an existing Tonic Textual dataset for scanning and redaction.",
-    { datasetId: z.string().describe("The dataset ID to upload to"), filePath: z.string().describe("Absolute path to the file to upload") },
-    withLogging(logger, "upload_file_to_dataset", async ({ datasetId, filePath }) => {
-      if (!fs.existsSync(filePath)) {
-        return { content: [{ type: "text" as const, text: `Error: File not found: ${filePath}` }], isError: true };
-      }
-      const upload = await client.uploadFileToDataset(datasetId, filePath);
+    "Upload a file to an existing Tonic Textual dataset for scanning and redaction. The file contents are sent inline as base64; no server-side filesystem access is required.",
+    { datasetId: z.string().describe("The dataset ID to upload to"), ...uploadFilePayloadSchemas },
+    withLogging(logger, "upload_file_to_dataset", async ({ datasetId, fileName, mimeType, contentBase64 }) => {
+      const payload = decodeUploadPayload({ fileName, mimeType, contentBase64 });
+      const upload = await client.uploadFileToDataset(datasetId, payload);
       const file = upload.uploadedFile;
       return {
         content: [{
           type: "text" as const,
           text: JSON.stringify({
             fileId: upload.uploadedFileId ?? file?.fileId ?? null,
-            fileName: file?.fileName ?? path.basename(filePath),
+            fileName: file?.fileName ?? payload.fileName,
             status: file?.processingStatus ?? null,
             message: "File uploaded to dataset. Textual will scan it for PII.",
           }, null, 2),
@@ -1008,14 +1074,15 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
   // --- download_dataset_file ---
   registerFull(() => s.tool(
     "download_dataset_file",
-    "Download a redacted version of a specific file from a dataset.",
-    { datasetId: z.string().describe("The dataset ID"), fileId: z.string().describe("The file ID within the dataset"), outputPath: z.string().describe("Absolute path where the redacted file should be saved") },
-    withLogging(logger, "download_dataset_file", async ({ datasetId, fileId, outputPath }) => {
+    "Download the redacted version of a specific file from a dataset. Returns the file contents inline as base64.",
+    {
+      datasetId: z.string().describe("The dataset ID"),
+      fileId: z.string().describe("The file ID within the dataset"),
+      fileName: z.string().optional().describe("Optional file name to label the response with. If omitted, falls back to fileId."),
+    },
+    withLogging(logger, "download_dataset_file", async ({ datasetId, fileId, fileName }) => {
       const buffer = await client.downloadDatasetFile(datasetId, fileId);
-      const dir = path.dirname(outputPath);
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(outputPath, buffer);
-      return { content: [{ type: "text" as const, text: `Redacted file saved to: ${outputPath} (${buffer.length} bytes)` }] };
+      return jsonTextResult(encodeBytesPayload(buffer, fileName ?? fileId));
     })
   ));
 
@@ -1424,17 +1491,14 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
   // --- upload_entity_test_file ---
   s.tool(
     "upload_entity_test_file",
-    "Upload a local test/review file for a model-based entity. The file must already exist on disk; Textual analyzes it asynchronously for version review workflows.",
+    "Upload a test/review file for a model-based entity. The file contents are sent inline as base64; Textual analyzes the file asynchronously for version review workflows.",
     {
       entityId: modelBasedEntityIdSchema,
-      filePath: z.string().describe("Absolute path to the local file to upload"),
+      ...uploadFilePayloadSchemas,
     },
-    withLogging(logger, "upload_entity_test_file", async ({ entityId, filePath }) => {
-      if (!fs.existsSync(filePath)) {
-        return { content: [{ type: "text" as const, text: `Error: File not found: ${filePath}` }], isError: true };
-      }
-
-      const file = await client.uploadEntityTestFile(entityId, filePath);
+    withLogging(logger, "upload_entity_test_file", async ({ entityId, fileName, mimeType, contentBase64 }) => {
+      const payload = decodeUploadPayload({ fileName, mimeType, contentBase64 });
+      const file = await client.uploadEntityTestFile(entityId, payload);
       return jsonTextResult({
         ...summarizeEntityTestFile(entityId, file),
         message: "Entity test file uploaded.",
@@ -1497,17 +1561,14 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
   // --- upload_entity_training_file ---
   s.tool(
     "upload_entity_training_file",
-    "Upload a local training file for a model-based entity. The file must already exist on disk; Textual analyzes it asynchronously before it can be used for model training.",
+    "Upload a training file for a model-based entity. The file contents are sent inline as base64; Textual analyzes the file asynchronously before it can be used for model training.",
     {
       entityId: modelBasedEntityIdSchema,
-      filePath: z.string().describe("Absolute path to the local file to upload"),
+      ...uploadFilePayloadSchemas,
     },
-    withLogging(logger, "upload_entity_training_file", async ({ entityId, filePath }) => {
-      if (!fs.existsSync(filePath)) {
-        return { content: [{ type: "text" as const, text: `Error: File not found: ${filePath}` }], isError: true };
-      }
-
-      const file = await client.uploadEntityTrainingFile(entityId, filePath);
+    withLogging(logger, "upload_entity_training_file", async ({ entityId, fileName, mimeType, contentBase64 }) => {
+      const payload = decodeUploadPayload({ fileName, mimeType, contentBase64 });
+      const file = await client.uploadEntityTrainingFile(entityId, payload);
       return jsonTextResult({
         ...summarizeEntityTrainingFile(file),
         message: "Entity training file uploaded.",
@@ -1863,7 +1924,7 @@ Recommended workflow: use scan_directory to preview, test redact_text/redact_jso
           const fileStart = Date.now();
           logger.info("file_redact_start", { tool: "deidentify_folder", file: item.relPath, ext: item.ext, mode: "file_upload" });
           try {
-            const job = await client.startFileRedaction(item.srcFull, signal);
+            const job = await client.startFileRedaction(loadLocalFilePayload(item.srcFull), signal);
             logger.info("file_upload_complete", { tool: "deidentify_folder", file: item.relPath, jobId: job.jobId, durationMs: Date.now() - fileStart });
             binaryJobs.push({ item, jobId: job.jobId });
           } catch (err: unknown) {

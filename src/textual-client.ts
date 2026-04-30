@@ -1,7 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { lookup } from "mime-types";
 import type { Logger } from "./logger.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -61,6 +60,16 @@ export interface FileRedactionJob {
   fileName: string;
 }
 
+// Bytes-in-payload upload contract. The MCP layer is responsible for
+// producing this from either a base64 input (hosted mode) or a local
+// file path (local-files mode); the client itself never reads the
+// caller's filesystem.
+export interface UploadFilePayload {
+  fileName: string;
+  mimeType: string;
+  content: Buffer;
+}
+
 export interface FileJob {
   id: string;
   status: string;
@@ -69,6 +78,7 @@ export interface FileJob {
   endTime: string | null;
   publishedTime: string;
   jobType: string;
+  fileName?: string;
 }
 
 export type GeneratorHandling =
@@ -499,55 +509,27 @@ export class TextualClient {
     return JSON.parse(text) as T;
   }
 
-  private getLocalFileForUpload(filePath: string): {
-    resolvedPath: string;
-    fileName: string;
-    fileBuffer: Buffer;
-    mimeType: string;
-  } {
-    const resolvedPath = path.resolve(filePath);
-
-    if (!fs.existsSync(resolvedPath)) {
-      throw new Error(`File does not exist: ${resolvedPath}`);
-    }
-
-    const stats = fs.statSync(resolvedPath);
-    if (!stats.isFile()) {
-      throw new Error(`Path is not a file: ${resolvedPath}`);
-    }
-
-    return {
-      resolvedPath,
-      fileName: path.basename(resolvedPath),
-      fileBuffer: fs.readFileSync(resolvedPath),
-      mimeType: lookup(resolvedPath) || "application/octet-stream",
-    };
-  }
-
   private toBlobPart(fileBuffer: Buffer): ArrayBuffer {
     return Uint8Array.from(fileBuffer).buffer;
   }
 
-  private createModelBasedEntityFileUploadFormData(filePath: string): {
-    formData: FormData;
-  } {
-    const { fileName, fileBuffer, mimeType } = this.getLocalFileForUpload(filePath);
+  private createModelBasedEntityFileUploadFormData(payload: UploadFilePayload): FormData {
     const formData = new FormData();
     formData.append(
       "document",
-      new Blob([JSON.stringify({ fileName })], { type: "application/json" })
+      new Blob([JSON.stringify({ fileName: payload.fileName })], { type: "application/json" })
     );
-    formData.append("file", new Blob([this.toBlobPart(fileBuffer)], { type: mimeType }), fileName);
-    return { formData };
+    formData.append("file", new Blob([this.toBlobPart(payload.content)], { type: payload.mimeType }), payload.fileName);
+    return formData;
   }
 
   private async uploadModelBasedEntityFile<T>(
     entityId: string,
     kind: "test" | "training",
-    filePath: string,
+    payload: UploadFilePayload,
     signal?: AbortSignal
   ): Promise<T> {
-    const { formData } = this.createModelBasedEntityFileUploadFormData(filePath);
+    const formData = this.createModelBasedEntityFileUploadFormData(payload);
     const encodedEntityId = encodeURIComponent(entityId);
     const res = await this.request(`/api/model-based-entities/${encodedEntityId}/${kind}/files`, {
       method: "POST",
@@ -967,17 +949,13 @@ export class TextualClient {
 
   // --- File Redaction (Unattached) ---
 
-  async startFileRedaction(filePath: string, signal?: AbortSignal): Promise<FileRedactionJob> {
-    const fileName = path.basename(filePath);
-    const fileBuffer = fs.readFileSync(filePath);
-    const mimeType = lookup(filePath) || "application/octet-stream";
-
+  async startFileRedaction(payload: UploadFilePayload, signal?: AbortSignal): Promise<FileRedactionJob> {
     const formData = new FormData();
     formData.append(
       "document",
       new Blob(
         [JSON.stringify({
-          fileName,
+          fileName: payload.fileName,
           csvConfig: {},
           datasetId: "",
           customPiiEntityIds: [],
@@ -985,14 +963,14 @@ export class TextualClient {
         { type: "application/json" }
       )
     );
-    formData.append("file", new Blob([this.toBlobPart(fileBuffer)], { type: mimeType }), fileName);
+    formData.append("file", new Blob([this.toBlobPart(payload.content)], { type: payload.mimeType }), payload.fileName);
 
     const res = await this.request("/api/unattachedfile/upload", {
       method: "POST",
       body: formData,
     }, signal);
     const data = await res.json();
-    return { jobId: data.jobId ?? data.id, fileName };
+    return { jobId: data.jobId ?? data.id, fileName: payload.fileName };
   }
 
   async listFileJobs(from?: string): Promise<FileJob[]> {
@@ -1040,17 +1018,13 @@ export class TextualClient {
     });
   }
 
-  async uploadFileToDataset(datasetId: string, filePath: string): Promise<DatasetUploadResponse> {
-    const fileName = path.basename(filePath);
-    const fileBuffer = fs.readFileSync(filePath);
-    const mimeType = lookup(filePath) || "application/octet-stream";
-
+  async uploadFileToDataset(datasetId: string, payload: UploadFilePayload): Promise<DatasetUploadResponse> {
     const formData = new FormData();
     formData.append(
       "document",
       new Blob(
         [JSON.stringify({
-          fileName,
+          fileName: payload.fileName,
           csvConfig: {},
           datasetId,
           customPiiEntityIds: [],
@@ -1058,7 +1032,7 @@ export class TextualClient {
         { type: "application/json" }
       )
     );
-    formData.append("file", new Blob([this.toBlobPart(fileBuffer)], { type: mimeType }), fileName);
+    formData.append("file", new Blob([this.toBlobPart(payload.content)], { type: payload.mimeType }), payload.fileName);
 
     const res = await this.request(`/api/Dataset/${datasetId}/files/upload`, {
       method: "POST",
@@ -1083,7 +1057,7 @@ export class TextualClient {
 
     const validatedData = data as DatasetUploadResponse;
     const uploadedFile = validatedData.updatedDataset.files.find((file) => file.fileId === validatedData.uploadedFileId)
-      ?? validatedData.updatedDataset.files.find((file) => file.fileName === fileName);
+      ?? validatedData.updatedDataset.files.find((file) => file.fileName === payload.fileName);
     return { ...validatedData, uploadedFile };
   }
 
@@ -1344,9 +1318,9 @@ export class TextualClient {
 
   async uploadEntityTestFile(
     entityId: string,
-    filePath: string
+    payload: UploadFilePayload
   ): Promise<ModelBasedEntityFileMinimalApiModel> {
-    return this.uploadModelBasedEntityFile(entityId, "test", filePath);
+    return this.uploadModelBasedEntityFile(entityId, "test", payload);
   }
 
   async listEntityTestFiles(entityId: string): Promise<ModelBasedEntityFileMinimalApiModel[]> {
@@ -1403,9 +1377,9 @@ export class TextualClient {
 
   async uploadEntityTrainingFile(
     entityId: string,
-    filePath: string
+    payload: UploadFilePayload
   ): Promise<ModelBasedEntityTrainingFileApiModel> {
-    return this.uploadModelBasedEntityFile(entityId, "training", filePath);
+    return this.uploadModelBasedEntityFile(entityId, "training", payload);
   }
 
   async listEntityTrainingFiles(
