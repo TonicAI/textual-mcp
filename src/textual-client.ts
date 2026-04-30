@@ -465,12 +465,23 @@ export class TextualClient {
           if (!res.ok) {
             const body = await res.text().catch(() => "");
             this.logger?.error("api_request_error", { method, endpoint, status: res.status, body, durationMs });
-            let detail = body;
-            try {
-              const parsed = JSON.parse(body);
-              detail = parsed.message || parsed.detail || parsed.title || body;
-            } catch {
-              // body is plain text, use as-is
+            // 401/403 means the per-session API key was rejected by Solar.
+            // Replace the raw upstream body with a clear, actionable message
+            // so callers (including task-based tools that bypass withLogging)
+            // surface something meaningful. Full upstream detail is already in
+            // the server-side log above.
+            let detail: string;
+            if (res.status === 401 || res.status === 403) {
+              detail =
+                "Authentication to Tonic Textual failed. Verify the Authorization header configured in your MCP client points to a valid, non-revoked API key for this server.";
+            } else {
+              detail = body;
+              try {
+                const parsed = JSON.parse(body);
+                detail = parsed.message || parsed.detail || parsed.title || body;
+              } catch {
+                // body is plain text, use as-is
+              }
             }
             const err = new Error(detail);
             (err as any).statusCode = res.status;
