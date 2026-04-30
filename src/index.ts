@@ -680,9 +680,19 @@ async function pollAndDownload(client: TextualClient, jobId: string, opts: Redac
 }
 
 // ============================================================
+// Tool-set profiles
+// ============================================================
+
+// "light" exposes only the curated model-based-entity workflow tools.
+// "full" exposes the complete tool surface (light + general redaction +
+// dataset population). Selected by the client via the connect-time URL
+// path: /mcp/light vs /mcp.
+type Profile = "light" | "full";
+
+// ============================================================
 // Register all tools on an McpServer instance
 // ============================================================
-function registerTools(s: McpServer, client: TextualClient) {
+function registerTools(s: McpServer, client: TextualClient, _profile: Profile) {
 
   // --- redact_text ---
   s.tool(
@@ -1900,6 +1910,7 @@ interface Session {
   server: McpServer;
   transport: StreamableHTTPServerTransport;
   client: TextualClient;
+  profile: Profile;
   createdAt: number;
   lastUsedAt: number;
 }
@@ -1937,12 +1948,12 @@ async function main() {
   // caller's API credential are fully isolated between sessions.
   const sessions = new Map<string, Session>();
 
-  function createSession(apiKey: string): Session {
+  function createSession(apiKey: string, profile: Profile): Session {
     const server = new McpServer({ name: "tonic-textual", version: "1.0.0" }, {
       taskStore: new InMemoryTaskStore(),
     });
     const client = new TextualClient(BASE_URL, apiKey, logger, MAX_CONCURRENT);
-    registerTools(server, client);
+    registerTools(server, client, profile);
     const now = Date.now();
     // Forward-declare the session so the SDK callbacks below can capture it
     // by reference; sessionId is assigned by the transport during the
@@ -1951,6 +1962,7 @@ async function main() {
       server,
       transport: undefined as unknown as StreamableHTTPServerTransport,
       client,
+      profile,
       createdAt: now,
       lastUsedAt: now,
     };
@@ -1958,7 +1970,7 @@ async function main() {
       sessionIdGenerator: () => randomUUID(),
       onsessioninitialized: (sid: string) => {
         sessions.set(sid, session);
-        logger.info("session_established", { sessionId: sid, totalSessions: sessions.size });
+        logger.info("session_established", { sessionId: sid, profile, totalSessions: sessions.size });
       },
     });
     transport.onclose = () => {
@@ -1971,8 +1983,8 @@ async function main() {
     return session;
   }
 
-  async function initializeSession(apiKey: string): Promise<Session> {
-    const session = createSession(apiKey);
+  async function initializeSession(apiKey: string, profile: Profile): Promise<Session> {
+    const session = createSession(apiKey, profile);
     await session.server.connect(session.transport);
     return session;
   }
@@ -1998,7 +2010,14 @@ async function main() {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
     logger.info("http_request", { method: req.method, path: url.pathname, sessionId: sessionId || null });
 
-    if (url.pathname === "/mcp") {
+    // Profile is selected by the connect-time path: /mcp/light → curated
+    // model-based-entity tools; /mcp → full toolset (default).
+    const profile: Profile | null =
+      url.pathname === "/mcp" ? "full" :
+      url.pathname === "/mcp/light" ? "light" :
+      null;
+
+    if (profile !== null) {
       try {
         // Route to existing session if session ID matches
         if (sessionId) {
@@ -2015,7 +2034,7 @@ async function main() {
         if (req.method === "POST") {
           const apiKey = extractApiKey(req);
           if (!apiKey) {
-            logger.info("session_init_unauthorized", { reason: "Missing Authorization header" });
+            logger.info("session_init_unauthorized", { reason: "Missing Authorization header", profile });
             writeJsonRpcError(
               res,
               401,
@@ -2025,17 +2044,17 @@ async function main() {
             return;
           }
           if (sessionId) {
-            logger.info("session_expired_reconnect", { expiredSessionId: sessionId });
+            logger.info("session_expired_reconnect", { expiredSessionId: sessionId, profile });
           } else {
-            logger.info("new_session", { reason: "POST without session header" });
+            logger.info("new_session", { reason: "POST without session header", profile });
           }
-          const session = await initializeSession(apiKey);
+          const session = await initializeSession(apiKey, profile);
           await session.transport.handleRequest(req, res);
           return;
         }
 
         // GET/DELETE with unknown session — nothing to reconnect to
-        logger.info("session_not_found", { method: req.method, sessionId: sessionId || null });
+        logger.info("session_not_found", { method: req.method, sessionId: sessionId || null, profile });
         writeJsonRpcError(res, 404, -32001, "Session not found");
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -2057,7 +2076,7 @@ async function main() {
   });
 
   httpServer.listen(port, () => {
-    logger.info("Tonic Textual MCP server running on HTTP", { port, endpoint: "/mcp" });
+    logger.info("Tonic Textual MCP server running on HTTP", { port, endpoints: ["/mcp", "/mcp/light"] });
   });
 }
 
