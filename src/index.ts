@@ -692,10 +692,17 @@ type Profile = "light" | "full";
 // ============================================================
 // Register all tools on an McpServer instance
 // ============================================================
-function registerTools(s: McpServer, client: TextualClient, _profile: Profile) {
+function registerTools(s: McpServer, client: TextualClient, profile: Profile) {
+  // Tools that only belong to the full profile are registered through this
+  // helper so the light profile (curated model-based-entity workflow) does
+  // not surface them. Keeps the diff minimal versus wrapping each tool in
+  // an `if` block, and makes profile membership grep-able at the call site.
+  const registerFull = (fn: () => void): void => {
+    if (profile === "full") fn();
+  };
 
   // --- redact_text ---
-  s.tool(
+  registerFull(() => s.tool(
     "redact_text",
     "Redact PII from a single plain text string. Returns the de-identified text and details about each detected entity. If you need to redact multiple files or an entire directory, use deidentify_folder instead — do NOT call this tool in a loop.",
     { text: z.string().describe("The text to de-identify"), ...redactOptionSchemas },
@@ -708,10 +715,10 @@ function registerTools(s: McpServer, client: TextualClient, _profile: Profile) {
         }],
       };
     })
-  );
+  ));
 
   // --- redact_bulk ---
-  s.tool(
+  registerFull(() => s.tool(
     "redact_bulk",
     "Redact PII from multiple text strings in one call. Efficient for batch processing.",
     { texts: z.array(z.string()).describe("Array of text strings to de-identify"), ...redactOptionSchemas },
@@ -722,10 +729,10 @@ function registerTools(s: McpServer, client: TextualClient, _profile: Profile) {
       }));
       return { content: [{ type: "text" as const, text: JSON.stringify(summary, null, 2) }] };
     })
-  );
+  ));
 
   // --- redact_json ---
-  s.tool(
+  registerFull(() => s.tool(
     "redact_json",
     "Redact PII from a single JSON string. Preserves JSON structure, only redacts text values. Supports JSONPath-based allow lists and ignore paths for fine-grained control. Use this to test options on ONE sample file, then pass those same options (including jsonPathIgnorePaths/jsonPathAllowLists) to deidentify_folder to process the full directory. Do NOT call this in a loop or write a script.",
     {
@@ -758,10 +765,10 @@ function registerTools(s: McpServer, client: TextualClient, _profile: Profile) {
         }],
       };
     })
-  );
+  ));
 
   // --- redact_xml ---
-  s.tool(
+  registerFull(() => s.tool(
     "redact_xml",
     "Redact PII from a single XML string. Preserves XML structure, only redacts text values and attributes. For multiple files, use deidentify_folder instead.",
     { xmlText: z.string().describe("The XML string to de-identify"), ...redactOptionSchemas },
@@ -774,10 +781,10 @@ function registerTools(s: McpServer, client: TextualClient, _profile: Profile) {
         }],
       };
     })
-  );
+  ));
 
   // --- redact_html ---
-  s.tool(
+  registerFull(() => s.tool(
     "redact_html",
     "Redact PII from a single HTML string. Preserves HTML structure, only redacts text content. For multiple files, use deidentify_folder instead.",
     { htmlText: z.string().describe("The HTML string to de-identify"), ...redactOptionSchemas },
@@ -790,7 +797,7 @@ function registerTools(s: McpServer, client: TextualClient, _profile: Profile) {
         }],
       };
     })
-  );
+  ));
 
   // --- list_pii_types ---
   s.tool(
@@ -804,7 +811,7 @@ function registerTools(s: McpServer, client: TextualClient, _profile: Profile) {
   );
 
   // --- redact_file (task-based: uploads immediately, processes in background) ---
-  s.experimental.tasks.registerToolTask(
+  registerFull(() => s.experimental.tasks.registerToolTask(
     "redact_file",
     {
       description: `Redact PII from a single binary file (PDF, docx, xlsx, images). Uploads the file to Textual and processes in the background — does NOT block while waiting.
@@ -879,10 +886,10 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
         return result as { content: Array<{ type: "text"; text: string }> };
       },
     }
-  );
+  ));
 
   // --- list_file_jobs ---
-  s.tool(
+  registerFull(() => s.tool(
     "list_file_jobs",
     "List all unattached file redaction jobs and their statuses. Optionally filter to jobs from a recent time window (e.g. '1h', '30m', '7d').",
     { from: z.string().optional().describe("Time window to look back, e.g. '1h', '30m', '7d'. Converted to TimeSpan format automatically. If omitted, returns all jobs.") },
@@ -890,10 +897,10 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
       const jobs = await client.listFileJobs(from ? toTimeSpan(from) : undefined);
       return { content: [{ type: "text" as const, text: JSON.stringify(jobs, null, 2) }] };
     })
-  );
+  ));
 
   // --- get_file_job ---
-  s.tool(
+  registerFull(() => s.tool(
     "get_file_job",
     "Get the status and details of a specific unattached file redaction job.",
     { jobId: z.string().describe("The job ID to check") },
@@ -901,10 +908,10 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
       const job = await client.getFileJob(jobId);
       return { content: [{ type: "text" as const, text: JSON.stringify(job, null, 2) }] };
     })
-  );
+  ));
 
   // --- download_redacted_file ---
-  s.tool(
+  registerFull(() => s.tool(
     "download_redacted_file",
     "Download the redacted version of an unattached file job that has already been uploaded and processed. Use get_file_job or list_file_jobs to find the job ID. Only works for jobs with Completed status.",
     {
@@ -921,10 +928,10 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
       fs.writeFileSync(params.outputPath, buffer);
       return { content: [{ type: "text" as const, text: `Redacted file saved to: ${params.outputPath} (${buffer.length} bytes)` }] };
     })
-  );
+  ));
 
   // --- get_job_error_logs ---
-  s.tool(
+  registerFull(() => s.tool(
     "get_job_error_logs",
     "Download error logs for a failed file redaction job. Only available for jobs with a failed status.",
     { jobId: z.string().describe("The job ID to get error logs for") },
@@ -932,10 +939,10 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
       const logs = await client.getJobErrorLogs(jobId);
       return { content: [{ type: "text" as const, text: logs || "No error logs available for this job." }] };
     })
-  );
+  ));
 
   // --- create_dataset ---
-  s.tool(
+  registerFull(() => s.tool(
     "create_dataset",
     "Create a new Tonic Textual dataset. Datasets are collections of files that can be scanned and redacted together with shared configuration.",
     { name: z.string().describe("Name for the new dataset") },
@@ -948,7 +955,7 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
         }],
       };
     })
-  );
+  ));
 
   // --- list_datasets ---
   s.tool(
@@ -974,7 +981,7 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
   );
 
   // --- upload_file_to_dataset ---
-  s.tool(
+  registerFull(() => s.tool(
     "upload_file_to_dataset",
     "Upload a file to an existing Tonic Textual dataset for scanning and redaction.",
     { datasetId: z.string().describe("The dataset ID to upload to"), filePath: z.string().describe("Absolute path to the file to upload") },
@@ -996,10 +1003,10 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
         }],
       };
     })
-  );
+  ));
 
   // --- download_dataset_file ---
-  s.tool(
+  registerFull(() => s.tool(
     "download_dataset_file",
     "Download a redacted version of a specific file from a dataset.",
     { datasetId: z.string().describe("The dataset ID"), fileId: z.string().describe("The file ID within the dataset"), outputPath: z.string().describe("Absolute path where the redacted file should be saved") },
@@ -1010,7 +1017,7 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
       fs.writeFileSync(outputPath, buffer);
       return { content: [{ type: "text" as const, text: `Redacted file saved to: ${outputPath} (${buffer.length} bytes)` }] };
     })
-  );
+  ));
 
   // --- create_model_based_entity ---
   s.tool(
@@ -1560,6 +1567,28 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
     })
   );
 
+  // --- list_entity_file_annotations ---
+  s.tool(
+    "list_entity_file_annotations",
+    "List annotations for every test/review file in an entity version. Returns each file's content, annotation spans, metrics, and review status in a single call. If versionId is omitted, the latest available entity version is used. Use this for cross-file review and to bulk-collect LLM annotations once test files have been processed.",
+    {
+      entityId: modelBasedEntityIdSchema,
+      versionId: modelBasedEntityVersionIdSchema.optional().describe("Optional entity version ID. If omitted, the latest available entity version is used."),
+    },
+    withLogging(logger, "list_entity_file_annotations", async ({ entityId, versionId }) => {
+      const resolvedVersionId = versionId ?? await resolveLatestEntityVersionId(client, entityId);
+      const version = await client.getEntityVersion(entityId, resolvedVersionId);
+      return jsonTextResult({
+        entityId,
+        versionId: version.id,
+        versionNumber: version.versionNumber,
+        status: version.status,
+        fileCount: version.files.length,
+        files: version.files.map((file) => summarizeEntityFileAnnotations(file)),
+      });
+    })
+  );
+
   // --- get_entity_file_annotations ---
   s.tool(
     "get_entity_file_annotations",
@@ -1609,7 +1638,7 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
   );
 
   // --- scan_directory ---
-  s.tool(
+  registerFull(() => s.tool(
     "scan_directory",
     "Scan a local directory tree and return an inventory of all files with their types and sizes. Use this to understand the structure before de-identifying.",
     {
@@ -1658,10 +1687,10 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
         }],
       };
     })
-  );
+  ));
 
   // --- deidentify_folder ---
-  s.tool(
+  registerFull(() => s.tool(
     "deidentify_folder",
     `De-identify an entire folder tree in a single call. This is the PREFERRED tool whenever the user wants to redact, de-identify, or anonymize multiple files or a directory. Do NOT loop over files calling redact_text/redact_file individually, and do NOT write scripts to batch-process files — use this tool instead.
 
@@ -1899,7 +1928,7 @@ Recommended workflow: use scan_directory to preview, test redact_text/redact_jso
         }],
       };
     })
-  );
+  ));
 }
 
 // ============================================================
