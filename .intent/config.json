@@ -1,0 +1,34 @@
+{
+  "scripts": [
+    {
+      "name": "build",
+      "command": "npm run build",
+      "mode": "command",
+      "category": "build"
+    },
+    {
+      "name": "start",
+      "command": "npm run start",
+      "mode": "service",
+      "category": "dev"
+    },
+    {
+      "name": "dev",
+      "command": "npm run dev",
+      "mode": "service",
+      "category": "dev"
+    },
+    {
+      "name": "prepublishOnly",
+      "command": "npm run prepublishOnly",
+      "mode": "command",
+      "category": "other"
+    },
+    {
+      "name": "clean",
+      "command": "npm run clean",
+      "mode": "command",
+      "category": "other"
+    }
+  ]
+}
