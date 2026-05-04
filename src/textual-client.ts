@@ -260,8 +260,12 @@ export interface ModelBasedEntityVersionApiModel {
   files: ModelBasedEntityFileVersionRecordMinimalApiModel[];
 }
 
+export type ModelBasedEntitySuggestedGuidelinesStatus = "Pending" | "Ready" | "Failed";
+
 export interface ModelBasedEntitySuggestedGuidelinesApiModel {
+  status: ModelBasedEntitySuggestedGuidelinesStatus;
   guidelines: string;
+  jobId: string | null;
 }
 
 export interface ModelBasedEntityTrainedModelApiModel {
@@ -1252,7 +1256,10 @@ export class TextualClient {
       `/api/model-based-entities/${encodedEntityId}/versions/${encodedVersionId}/suggested-guidelines`,
       {}
     );
-    return typeof data === "string" ? { guidelines: data } : data;
+    if (typeof data === "string") {
+      return { status: "Ready", guidelines: data, jobId: null };
+    }
+    return data;
   }
 
   async listEntityVersions(entityId: string): Promise<ModelBasedEntityVersionApiModel[]> {

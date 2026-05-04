@@ -1358,14 +1358,20 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
   // --- get_suggested_guidelines ---
   s.tool(
     "get_suggested_guidelines",
-    "Get suggested guideline refinements for a specific entity version after Textual has generated them.",
+    "Get suggested guideline refinements for a specific entity version. Returns a status field (Pending while Textual is still generating, Ready once available, Failed if generation failed); guidelines are populated only when status is Ready.",
     {
       entityId: modelBasedEntityIdSchema,
       versionId: modelBasedEntityVersionIdSchema,
     },
     withLogging(logger, "get_suggested_guidelines", async ({ entityId, versionId }) => {
       const result = await client.getSuggestedGuidelines(entityId, versionId);
-      return jsonTextResult({ entityId, versionId, guidelines: result.guidelines });
+      return jsonTextResult({
+        entityId,
+        versionId,
+        status: result.status,
+        guidelines: result.guidelines,
+        jobId: result.jobId,
+      });
     })
   );
 
