@@ -222,7 +222,7 @@ export interface ModelBasedEntityFileFullApiModel extends ModelBasedEntityFileMi
   groundTruth: ModelBasedEntityAnnotationSpan[];
 }
 
-export interface ModelBasedEntityFileVersionRecordWithAnnotations {
+export interface ModelBasedEntityFileVersionRecordMinimalApiModel {
   id: string;
   fileId: string;
   versionId: string;
@@ -237,6 +237,10 @@ export interface ModelBasedEntityFileVersionRecordWithAnnotations {
   errorType: string | null;
   errorDetails: string | null;
   createdAt: string;
+}
+
+export interface ModelBasedEntityFileVersionRecordWithAnnotations
+  extends ModelBasedEntityFileVersionRecordMinimalApiModel {
   content: string;
   annotations: ModelBasedEntityAnnotationSpan[];
 }
@@ -253,7 +257,7 @@ export interface ModelBasedEntityVersionApiModel {
   status: ModelBasedEntityVersionStatus;
   errorType: string | null;
   errorDetails: string | null;
-  files: ModelBasedEntityFileVersionRecordWithAnnotations[];
+  files: ModelBasedEntityFileVersionRecordMinimalApiModel[];
 }
 
 export interface ModelBasedEntitySuggestedGuidelinesApiModel {

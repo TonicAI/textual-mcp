@@ -1760,13 +1760,21 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
     withLogging(logger, "list_entity_file_annotations", async ({ entityId, versionId }) => {
       const resolvedVersionId = versionId ?? await resolveLatestEntityVersionId(client, entityId);
       const version = await client.getEntityVersion(entityId, resolvedVersionId);
+      // The version endpoint returns a minimal file list (no content/annotations).
+      // Fan out a per-file fetch to collect annotations; the client semaphore
+      // bounds in-flight requests so this is safe for large versions.
+      const filesWithAnnotations = await Promise.all(
+        version.files.map((file) =>
+          client.getEntityFileAnnotations(entityId, version.id, file.fileId)
+        )
+      );
       return jsonTextResult({
         entityId,
         versionId: version.id,
         versionNumber: version.versionNumber,
         status: version.status,
         fileCount: version.files.length,
-        files: version.files.map((file) => summarizeEntityFileAnnotations(file)),
+        files: filesWithAnnotations.map((file) => summarizeEntityFileAnnotations(file)),
       });
     })
   );
