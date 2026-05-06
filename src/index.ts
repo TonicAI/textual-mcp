@@ -2167,6 +2167,7 @@ function writeJsonRpcError(
 
 async function main() {
   const port = parseInt(process.env.PORT || "3000", 10);
+  const url = BASE_URL;
 
   // Each session gets its own McpServer + Transport + TextualClient so that
   // in-flight request state, abort controllers, response handlers, and the
@@ -2302,6 +2303,7 @@ async function main() {
 
   httpServer.listen(port, () => {
     logger.info("Tonic Textual MCP server running on HTTP", {
+      url,
       port,
       endpoints: ["/mcp", "/mcp/light"],
       allowLocalFiles: ALLOW_LOCAL_FILES,
