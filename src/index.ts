@@ -9,6 +9,7 @@ import { z } from "zod";
 import fs from "node:fs";
 import path from "node:path";
 import { lookup } from "mime-types";
+import { Agent, type Dispatcher } from "undici";
 import {
   TextualClient,
   type Dataset,
@@ -30,22 +31,31 @@ import {
   type ModelBasedEntityTrainedModelApiModel,
   type ModelBasedEntityVersionApiModel,
   type RedactOptions,
+  type UploadFilePayload,
 } from "./textual-client.js";
 import { Logger, withLogging } from "./logger.js";
 
 const BASE_URL = process.env.TONIC_TEXTUAL_BASE_URL || "https://textual.tonic.ai";
-const API_KEY = process.env.TONIC_TEXTUAL_API_KEY;
-
-if (!API_KEY) {
-  console.error("TONIC_TEXTUAL_API_KEY environment variable is required");
-  process.exit(1);
-}
 
 const logger = new Logger();
 const MAX_CONCURRENT = parseInt(process.env.TONIC_TEXTUAL_MAX_CONCURRENT_REQUESTS || "50", 10);
 const POLL_INTERVAL_MS = 5000;
 const POLL_TIMEOUT_S = parseInt(process.env.TONIC_TEXTUAL_POLL_TIMEOUT_SECONDS || "900", 10);
-const client = new TextualClient(BASE_URL, API_KEY, logger, MAX_CONCURRENT);
+const SESSION_IDLE_TIMEOUT_MS = parseInt(process.env.TONIC_TEXTUAL_SESSION_IDLE_TIMEOUT_MS || `${30 * 60 * 1000}`, 10);
+const SESSION_JANITOR_INTERVAL_MS = 60 * 1000;
+// Local-files mode: when set, the server is treated as running on the
+// caller's machine (e.g. an `npm i -g` install next to Claude Desktop)
+// and may read/write the local filesystem. Default is hosted-mode where
+// only base64 payloads are accepted.
+const ALLOW_LOCAL_FILES = /^(1|true|yes|on)$/i.test(process.env.TONIC_TEXTUAL_ALLOW_LOCAL_FILES ?? "");
+// Opt-in: skip TLS certificate verification on outbound calls to the Textual
+// REST API. Intended for self-hosted instances using self-signed certs; do
+// not enable in production. Scoped to TextualClient via an undici dispatcher
+// so it does not affect the MCP server's own TLS or any other code.
+const INSECURE_TLS = /^(1|true|yes|on)$/i.test(process.env.TONIC_TEXTUAL_INSECURE_TLS ?? "");
+const TEXTUAL_DISPATCHER: Dispatcher | undefined = INSECURE_TLS
+  ? new Agent({ connect: { rejectUnauthorized: false } })
+  : undefined;
 
 // --- Shared schemas ---
 
@@ -63,6 +73,157 @@ const generatorConfigSchema = z
 const generatorDefaultSchema = generatorHandlingEnum
   .optional()
   .describe("Default handling for entity types not specified in generatorConfig");
+
+// Bytes-canonical file upload schema. The MCP server is hosted by
+// default and has no access to the caller's filesystem, so callers send
+// file contents inline. When TONIC_TEXTUAL_ALLOW_LOCAL_FILES is set,
+// uploadFilePayloadSchemas() relaxes those fields and adds an optional
+// filePath alternative; resolveUploadPayload() picks whichever the
+// caller supplied.
+function uploadFilePayloadSchemas(allowLocal: boolean): Record<string, z.ZodTypeAny> {
+  if (!allowLocal) {
+    return {
+      fileName: z.string().describe("Name to record for the file (including extension)."),
+      mimeType: z
+        .string()
+        .optional()
+        .describe("MIME type of the file. If omitted, inferred from fileName extension."),
+      contentBase64: z.string().describe("File contents, base64-encoded."),
+    };
+  }
+  return {
+    fileName: z
+      .string()
+      .optional()
+      .describe("Name to record for the file (including extension). Required when uploading inline contents; ignored when filePath is provided."),
+    mimeType: z
+      .string()
+      .optional()
+      .describe("MIME type of the file. If omitted, inferred from fileName/filePath extension."),
+    contentBase64: z
+      .string()
+      .optional()
+      .describe("File contents, base64-encoded. Mutually exclusive with filePath."),
+    filePath: z
+      .string()
+      .optional()
+      .describe("Local-install only: absolute path to the file to upload. Mutually exclusive with contentBase64."),
+  };
+}
+
+function downloadOutputPathSchema(allowLocal: boolean): Record<string, z.ZodTypeAny> {
+  return allowLocal
+    ? {
+        outputPath: z
+          .string()
+          .optional()
+          .describe(
+            "Local-install only: absolute path to write the redacted file to. When provided, returns the saved path instead of inline base64."
+          ),
+      }
+    : {};
+}
+
+function decodeUploadPayload(input: {
+  fileName: string;
+  mimeType?: string;
+  contentBase64: string;
+}): UploadFilePayload {
+  let content: Buffer;
+  try {
+    content = Buffer.from(input.contentBase64, "base64");
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`Invalid contentBase64: ${msg}`);
+  }
+  if (content.length === 0) {
+    throw new Error("contentBase64 decoded to zero bytes; provide non-empty file contents.");
+  }
+  const mimeType = input.mimeType?.trim() || lookup(input.fileName) || "application/octet-stream";
+  return { fileName: input.fileName, mimeType, content };
+}
+
+function loadLocalFilePayload(filePath: string): UploadFilePayload {
+  const resolved = path.resolve(filePath);
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`File not found: ${resolved}`);
+  }
+  const stats = fs.statSync(resolved);
+  if (!stats.isFile()) {
+    throw new Error(`Path is not a file: ${resolved}`);
+  }
+  return {
+    fileName: path.basename(resolved),
+    mimeType: lookup(resolved) || "application/octet-stream",
+    content: fs.readFileSync(resolved),
+  };
+}
+
+function encodeBytesPayload(buffer: Buffer, fileName: string, mimeType?: string): {
+  fileName: string;
+  mimeType: string;
+  bytes: number;
+  contentBase64: string;
+} {
+  return {
+    fileName,
+    mimeType: mimeType || lookup(fileName) || "application/octet-stream",
+    bytes: buffer.length,
+    contentBase64: buffer.toString("base64"),
+  };
+}
+
+// Loose params shape used by all upload-bearing tool handlers. TypeScript
+// can't infer the shape across the conditional uploadFilePayloadSchemas
+// helper, so handlers cast their incoming params to this and rely on
+// resolveUploadPayload to enforce per-mode validation at runtime.
+type UploadToolParams = {
+  fileName?: string;
+  mimeType?: string;
+  contentBase64?: string;
+  filePath?: string;
+};
+
+type DownloadOutputParams = { outputPath?: string };
+
+function resolveUploadPayload(
+  input: UploadToolParams,
+  allowLocal: boolean
+): UploadFilePayload {
+  if (input.filePath) {
+    if (!allowLocal) {
+      throw new Error(
+        "filePath is not supported on this server. Set TONIC_TEXTUAL_ALLOW_LOCAL_FILES=true to enable local-install mode, or supply contentBase64 instead."
+      );
+    }
+    if (input.contentBase64) {
+      throw new Error("Provide either filePath or contentBase64, not both.");
+    }
+    const payload = loadLocalFilePayload(input.filePath);
+    if (input.mimeType?.trim()) payload.mimeType = input.mimeType.trim();
+    if (input.fileName?.trim()) payload.fileName = input.fileName.trim();
+    return payload;
+  }
+  if (!input.fileName) {
+    throw new Error("fileName is required when uploading inline contents.");
+  }
+  if (!input.contentBase64) {
+    throw new Error("contentBase64 is required when uploading inline contents.");
+  }
+  return decodeUploadPayload({
+    fileName: input.fileName,
+    mimeType: input.mimeType,
+    contentBase64: input.contentBase64,
+  });
+}
+
+function writeLocalOutput(buffer: Buffer, outputPath: string): { savedTo: string; bytes: number } {
+  const resolved = path.resolve(outputPath);
+  const dir = path.dirname(resolved);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(resolved, buffer);
+  return { savedTo: resolved, bytes: buffer.length };
+}
 
 const labelCustomListSchema = z.object({
   strings: z.array(z.string()).optional().describe("Literal strings to match"),
@@ -425,7 +586,7 @@ function summarizeEntityFileAnnotations(file: ModelBasedEntityFileVersionRecordW
   };
 }
 
-async function resolveLatestEntityVersionId(entityId: string): Promise<string> {
+async function resolveLatestEntityVersionId(client: TextualClient, entityId: string): Promise<string> {
   const versions = await client.listEntityVersions(entityId);
   const latestVersion = versions.reduce<ModelBasedEntityVersionApiModel | null>((currentLatest, version) => {
     if (!currentLatest || version.versionNumber > currentLatest.versionNumber) {
@@ -665,7 +826,7 @@ function toTimeSpan(input: string): string {
 }
 
 // Helper: poll for file processing completion then download
-async function pollAndDownload(jobId: string, opts: RedactOptions, signal?: AbortSignal): Promise<Buffer> {
+async function pollAndDownload(client: TextualClient, jobId: string, opts: RedactOptions, signal?: AbortSignal): Promise<Buffer> {
   const maxAttempts = Math.ceil(POLL_TIMEOUT_S / (POLL_INTERVAL_MS / 1000));
   for (let i = 0; i < maxAttempts; i++) {
     signal?.throwIfAborted();
@@ -685,12 +846,37 @@ async function pollAndDownload(jobId: string, opts: RedactOptions, signal?: Abor
 }
 
 // ============================================================
+// Tool-set profiles
+// ============================================================
+
+// "light" exposes only the curated model-based-entity workflow tools.
+// "full" exposes the complete tool surface (light + general redaction +
+// dataset population). Selected by the client via the connect-time URL
+// path: /mcp/light vs /mcp.
+type Profile = "light" | "full";
+
+// ============================================================
 // Register all tools on an McpServer instance
 // ============================================================
-function registerTools(s: McpServer) {
+function registerTools(s: McpServer, client: TextualClient, profile: Profile, allowLocalFiles: boolean) {
+  // Tools that only belong to the full profile are registered through this
+  // helper so the light profile (curated model-based-entity workflow) does
+  // not surface them. Keeps the diff minimal versus wrapping each tool in
+  // an `if` block, and makes profile membership grep-able at the call site.
+  const registerFull = (fn: () => void): void => {
+    if (profile === "full") fn();
+  };
+  // Tools that only make sense when the server can read/write the
+  // caller's local filesystem (local-install mode). They are also FULL-only
+  // by virtue of being wrapped in registerFull at the call site.
+  const registerLocal = (fn: () => void): void => {
+    if (allowLocalFiles) fn();
+  };
+  const uploadSchemas = uploadFilePayloadSchemas(allowLocalFiles);
+  const downloadOutputSchema = downloadOutputPathSchema(allowLocalFiles);
 
   // --- redact_text ---
-  s.tool(
+  registerFull(() => s.tool(
     "redact_text",
     "Redact PII from a single plain text string. Returns the de-identified text and details about each detected entity. If you need to redact multiple files or an entire directory, use deidentify_folder instead — do NOT call this tool in a loop.",
     { text: z.string().describe("The text to de-identify"), ...redactOptionSchemas },
@@ -703,10 +889,10 @@ function registerTools(s: McpServer) {
         }],
       };
     })
-  );
+  ));
 
   // --- redact_bulk ---
-  s.tool(
+  registerFull(() => s.tool(
     "redact_bulk",
     "Redact PII from multiple text strings in one call. Efficient for batch processing.",
     { texts: z.array(z.string()).describe("Array of text strings to de-identify"), ...redactOptionSchemas },
@@ -717,10 +903,10 @@ function registerTools(s: McpServer) {
       }));
       return { content: [{ type: "text" as const, text: JSON.stringify(summary, null, 2) }] };
     })
-  );
+  ));
 
   // --- redact_json ---
-  s.tool(
+  registerFull(() => s.tool(
     "redact_json",
     "Redact PII from a single JSON string. Preserves JSON structure, only redacts text values. Supports JSONPath-based allow lists and ignore paths for fine-grained control. Use this to test options on ONE sample file, then pass those same options (including jsonPathIgnorePaths/jsonPathAllowLists) to deidentify_folder to process the full directory. Do NOT call this in a loop or write a script.",
     {
@@ -753,10 +939,10 @@ function registerTools(s: McpServer) {
         }],
       };
     })
-  );
+  ));
 
   // --- redact_xml ---
-  s.tool(
+  registerFull(() => s.tool(
     "redact_xml",
     "Redact PII from a single XML string. Preserves XML structure, only redacts text values and attributes. For multiple files, use deidentify_folder instead.",
     { xmlText: z.string().describe("The XML string to de-identify"), ...redactOptionSchemas },
@@ -769,10 +955,10 @@ function registerTools(s: McpServer) {
         }],
       };
     })
-  );
+  ));
 
   // --- redact_html ---
-  s.tool(
+  registerFull(() => s.tool(
     "redact_html",
     "Redact PII from a single HTML string. Preserves HTML structure, only redacts text content. For multiple files, use deidentify_folder instead.",
     { htmlText: z.string().describe("The HTML string to de-identify"), ...redactOptionSchemas },
@@ -785,7 +971,7 @@ function registerTools(s: McpServer) {
         }],
       };
     })
-  );
+  ));
 
   // --- list_pii_types ---
   s.tool(
@@ -799,50 +985,50 @@ function registerTools(s: McpServer) {
   );
 
   // --- redact_file (task-based: uploads immediately, processes in background) ---
-  s.experimental.tasks.registerToolTask(
+  registerFull(() => s.experimental.tasks.registerToolTask(
     "redact_file",
     {
-      description: `Redact PII from a single binary file (PDF, docx, xlsx, images). Uploads the file to Textual and processes in the background — does NOT block while waiting.
+      description: `Redact PII from a single binary file (PDF, docx, xlsx, images). The file contents are sent inline as base64; Textual processes them in the background and the redacted bytes are returned in the task completion payload — this call does NOT block waiting for completion.
 
 Do NOT use this for text-based files (.txt, .json, .xml, .html, .htm, .csv, .tsv). Use redact_text, redact_json, redact_xml, or redact_html instead — they are faster and return inline results.
 
-IMPORTANT: If you need to redact multiple files or an entire directory, use deidentify_folder instead — do NOT call this tool in a loop or write a script to iterate over files.
-
 Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
       inputSchema: {
-        filePath: z.string().describe("Absolute path to the file to redact"),
-        outputPath: z.string().describe("Absolute path where the redacted file should be saved"),
+        ...uploadSchemas,
         ...redactOptionSchemas,
       },
       execution: { taskSupport: "optional" as const },
     },
     {
       createTask: async (params, extra) => {
-        logger.logToolCall("redact_file", params as Record<string, unknown>);
-        if (!fs.existsSync(params.filePath)) {
-          throw new Error(`File not found: ${params.filePath}`);
-        }
-        const ext = path.extname(params.filePath).toLowerCase();
+        const upload = params as UploadToolParams;
+        logger.logToolCall("redact_file", {
+          fileName: upload.fileName,
+          mimeType: upload.mimeType,
+          ...(allowLocalFiles && upload.filePath ? { filePath: upload.filePath } : {}),
+        });
+        const payload = resolveUploadPayload(upload, allowLocalFiles);
+        const ext = path.extname(payload.fileName).toLowerCase();
         const textTypes = [".txt", ".json", ".html", ".htm", ".xml", ".csv", ".tsv"];
         if (textTypes.includes(ext)) {
           throw new Error(`${ext} files should be redacted using the text-based redaction tools (redact_text, redact_json, redact_xml, redact_html) which are faster and return inline results.`);
         }
 
-        const job = await client.startFileRedaction(params.filePath);
+        const job = await client.startFileRedaction(payload);
         const opts = buildRedactOpts(params);
         const task = await extra.taskStore.createTask({ ttl: (POLL_TIMEOUT_S + 60) * 1000, pollInterval: POLL_INTERVAL_MS });
-        logger.info("redact_file_task_created", { taskId: task.taskId, jobId: job.jobId, file: params.filePath });
+        logger.info("redact_file_task_created", { taskId: task.taskId, jobId: job.jobId, file: payload.fileName });
 
-        // Background: poll for completion, download, save
+        // Background: poll for completion, then store the redacted bytes in
+        // the task result. Hosted MCP servers can't write to the caller's
+        // disk, so the bytes ride back inline as base64.
         (async () => {
           try {
-            const buffer = await pollAndDownload(job.jobId, opts);
-            const dir = path.dirname(params.outputPath);
-            if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-            fs.writeFileSync(params.outputPath, buffer);
-            logger.info("redact_file_task_complete", { taskId: task.taskId, outputPath: params.outputPath, bytes: buffer.length });
+            const buffer = await pollAndDownload(client, job.jobId, opts);
+            logger.info("redact_file_task_complete", { taskId: task.taskId, file: payload.fileName, bytes: buffer.length });
+            const result = encodeBytesPayload(buffer, payload.fileName, payload.mimeType);
             await extra.taskStore.storeTaskResult(task.taskId, "completed", {
-              content: [{ type: "text" as const, text: `Redacted file saved to: ${params.outputPath} (${buffer.length} bytes)` }],
+              content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
             });
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
@@ -874,10 +1060,10 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
         return result as { content: Array<{ type: "text"; text: string }> };
       },
     }
-  );
+  ));
 
   // --- list_file_jobs ---
-  s.tool(
+  registerFull(() => s.tool(
     "list_file_jobs",
     "List all unattached file redaction jobs and their statuses. Optionally filter to jobs from a recent time window (e.g. '1h', '30m', '7d').",
     { from: z.string().optional().describe("Time window to look back, e.g. '1h', '30m', '7d'. Converted to TimeSpan format automatically. If omitted, returns all jobs.") },
@@ -885,10 +1071,10 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
       const jobs = await client.listFileJobs(from ? toTimeSpan(from) : undefined);
       return { content: [{ type: "text" as const, text: JSON.stringify(jobs, null, 2) }] };
     })
-  );
+  ));
 
   // --- get_file_job ---
-  s.tool(
+  registerFull(() => s.tool(
     "get_file_job",
     "Get the status and details of a specific unattached file redaction job.",
     { jobId: z.string().describe("The job ID to check") },
@@ -896,30 +1082,43 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
       const job = await client.getFileJob(jobId);
       return { content: [{ type: "text" as const, text: JSON.stringify(job, null, 2) }] };
     })
-  );
+  ));
 
   // --- download_redacted_file ---
-  s.tool(
+  registerFull(() => s.tool(
     "download_redacted_file",
-    "Download the redacted version of an unattached file job that has already been uploaded and processed. Use get_file_job or list_file_jobs to find the job ID. Only works for jobs with Completed status.",
+    "Download the redacted version of an unattached file job that has already been uploaded and processed. Use get_file_job or list_file_jobs to find the job ID. Only works for jobs with Completed status. Returns the file contents inline as base64.",
     {
       jobId: z.string().describe("The job ID of a completed file redaction job"),
-      outputPath: z.string().describe("Absolute path where the redacted file should be saved"),
+      fileName: z.string().optional().describe("Optional file name to label the response with. If omitted, falls back to the job's recorded fileName, then jobId."),
+      ...downloadOutputSchema,
       ...redactOptionSchemas,
     },
     withLogging(logger, "download_redacted_file", async (params, extra) => {
       const signal: AbortSignal | undefined = extra?.signal;
       const opts = buildRedactOpts(params);
       const buffer = await client.downloadRedactedFile(params.jobId, opts, signal);
-      const dir = path.dirname(params.outputPath);
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(params.outputPath, buffer);
-      return { content: [{ type: "text" as const, text: `Redacted file saved to: ${params.outputPath} (${buffer.length} bytes)` }] };
+      let resolvedFileName = params.fileName?.trim();
+      if (!resolvedFileName) {
+        try {
+          const job = await client.getFileJob(params.jobId);
+          if (job?.fileName) resolvedFileName = job.fileName;
+        } catch {
+          // ignore — fall back to jobId
+        }
+      }
+      const labelName = resolvedFileName ?? params.jobId;
+      const outputPath = (params as unknown as DownloadOutputParams).outputPath;
+      if (allowLocalFiles && outputPath) {
+        const { savedTo, bytes } = writeLocalOutput(buffer, outputPath);
+        return jsonTextResult({ fileName: labelName, savedTo, bytes });
+      }
+      return jsonTextResult(encodeBytesPayload(buffer, labelName));
     })
-  );
+  ));
 
   // --- get_job_error_logs ---
-  s.tool(
+  registerFull(() => s.tool(
     "get_job_error_logs",
     "Download error logs for a failed file redaction job. Only available for jobs with a failed status.",
     { jobId: z.string().describe("The job ID to get error logs for") },
@@ -927,10 +1126,10 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
       const logs = await client.getJobErrorLogs(jobId);
       return { content: [{ type: "text" as const, text: logs || "No error logs available for this job." }] };
     })
-  );
+  ));
 
   // --- create_dataset ---
-  s.tool(
+  registerFull(() => s.tool(
     "create_dataset",
     "Create a new Tonic Textual dataset. Datasets are collections of files that can be scanned and redacted together with shared configuration.",
     { name: z.string().describe("Name for the new dataset") },
@@ -943,7 +1142,7 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
         }],
       };
     })
-  );
+  ));
 
   // --- list_datasets ---
   s.tool(
@@ -969,43 +1168,51 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
   );
 
   // --- upload_file_to_dataset ---
-  s.tool(
+  registerFull(() => s.tool(
     "upload_file_to_dataset",
-    "Upload a file to an existing Tonic Textual dataset for scanning and redaction.",
-    { datasetId: z.string().describe("The dataset ID to upload to"), filePath: z.string().describe("Absolute path to the file to upload") },
-    withLogging(logger, "upload_file_to_dataset", async ({ datasetId, filePath }) => {
-      if (!fs.existsSync(filePath)) {
-        return { content: [{ type: "text" as const, text: `Error: File not found: ${filePath}` }], isError: true };
-      }
-      const upload = await client.uploadFileToDataset(datasetId, filePath);
+    "Upload a file to an existing Tonic Textual dataset for scanning and redaction. The file contents are sent inline as base64; no server-side filesystem access is required.",
+    { datasetId: z.string().describe("The dataset ID to upload to"), ...uploadSchemas },
+    withLogging(logger, "upload_file_to_dataset", async (params) => {
+      const { datasetId } = params;
+      const payload = resolveUploadPayload(params as unknown as UploadToolParams, allowLocalFiles);
+      const upload = await client.uploadFileToDataset(datasetId, payload);
       const file = upload.uploadedFile;
       return {
         content: [{
           type: "text" as const,
           text: JSON.stringify({
             fileId: upload.uploadedFileId ?? file?.fileId ?? null,
-            fileName: file?.fileName ?? path.basename(filePath),
+            fileName: file?.fileName ?? payload.fileName,
             status: file?.processingStatus ?? null,
             message: "File uploaded to dataset. Textual will scan it for PII.",
           }, null, 2),
         }],
       };
     })
-  );
+  ));
 
   // --- download_dataset_file ---
-  s.tool(
+  registerFull(() => s.tool(
     "download_dataset_file",
-    "Download a redacted version of a specific file from a dataset.",
-    { datasetId: z.string().describe("The dataset ID"), fileId: z.string().describe("The file ID within the dataset"), outputPath: z.string().describe("Absolute path where the redacted file should be saved") },
-    withLogging(logger, "download_dataset_file", async ({ datasetId, fileId, outputPath }) => {
+    "Download the redacted version of a specific file from a dataset. Returns the file contents inline as base64.",
+    {
+      datasetId: z.string().describe("The dataset ID"),
+      fileId: z.string().describe("The file ID within the dataset"),
+      fileName: z.string().optional().describe("Optional file name to label the response with. If omitted, falls back to fileId."),
+      ...downloadOutputSchema,
+    },
+    withLogging(logger, "download_dataset_file", async (params) => {
+      const { datasetId, fileId, fileName } = params;
       const buffer = await client.downloadDatasetFile(datasetId, fileId);
-      const dir = path.dirname(outputPath);
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(outputPath, buffer);
-      return { content: [{ type: "text" as const, text: `Redacted file saved to: ${outputPath} (${buffer.length} bytes)` }] };
+      const labelName = fileName ?? fileId;
+      const outputPath = (params as unknown as DownloadOutputParams).outputPath;
+      if (allowLocalFiles && outputPath) {
+        const { savedTo, bytes } = writeLocalOutput(buffer, outputPath);
+        return jsonTextResult({ fileName: labelName, savedTo, bytes });
+      }
+      return jsonTextResult(encodeBytesPayload(buffer, labelName));
     })
-  );
+  ));
 
   // --- create_model_based_entity ---
   s.tool(
@@ -1160,14 +1367,20 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
   // --- get_suggested_guidelines ---
   s.tool(
     "get_suggested_guidelines",
-    "Get suggested guideline refinements for a specific entity version after Textual has generated them.",
+    "Get suggested guideline refinements for a specific entity version. Returns a status field (Pending while Textual is still generating, Ready once available, Failed if generation failed); guidelines are populated only when status is Ready.",
     {
       entityId: modelBasedEntityIdSchema,
       versionId: modelBasedEntityVersionIdSchema,
     },
     withLogging(logger, "get_suggested_guidelines", async ({ entityId, versionId }) => {
       const result = await client.getSuggestedGuidelines(entityId, versionId);
-      return jsonTextResult({ entityId, versionId, guidelines: result.guidelines });
+      return jsonTextResult({
+        entityId,
+        versionId,
+        status: result.status,
+        guidelines: result.guidelines,
+        jobId: result.jobId,
+      });
     })
   );
 
@@ -1412,17 +1625,15 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
   // --- upload_entity_test_file ---
   s.tool(
     "upload_entity_test_file",
-    "Upload a local test/review file for a model-based entity. The file must already exist on disk; Textual analyzes it asynchronously for version review workflows.",
+    "Upload a test/review file for a model-based entity. The file contents are sent inline as base64; Textual analyzes the file asynchronously for version review workflows.",
     {
       entityId: modelBasedEntityIdSchema,
-      filePath: z.string().describe("Absolute path to the local file to upload"),
+      ...uploadSchemas,
     },
-    withLogging(logger, "upload_entity_test_file", async ({ entityId, filePath }) => {
-      if (!fs.existsSync(filePath)) {
-        return { content: [{ type: "text" as const, text: `Error: File not found: ${filePath}` }], isError: true };
-      }
-
-      const file = await client.uploadEntityTestFile(entityId, filePath);
+    withLogging(logger, "upload_entity_test_file", async (params) => {
+      const { entityId } = params;
+      const payload = resolveUploadPayload(params as unknown as UploadToolParams, allowLocalFiles);
+      const file = await client.uploadEntityTestFile(entityId, payload);
       return jsonTextResult({
         ...summarizeEntityTestFile(entityId, file),
         message: "Entity test file uploaded.",
@@ -1485,17 +1696,15 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
   // --- upload_entity_training_file ---
   s.tool(
     "upload_entity_training_file",
-    "Upload a local training file for a model-based entity. The file must already exist on disk; Textual analyzes it asynchronously before it can be used for model training.",
+    "Upload a training file for a model-based entity. The file contents are sent inline as base64; Textual analyzes the file asynchronously before it can be used for model training.",
     {
       entityId: modelBasedEntityIdSchema,
-      filePath: z.string().describe("Absolute path to the local file to upload"),
+      ...uploadSchemas,
     },
-    withLogging(logger, "upload_entity_training_file", async ({ entityId, filePath }) => {
-      if (!fs.existsSync(filePath)) {
-        return { content: [{ type: "text" as const, text: `Error: File not found: ${filePath}` }], isError: true };
-      }
-
-      const file = await client.uploadEntityTrainingFile(entityId, filePath);
+    withLogging(logger, "upload_entity_training_file", async (params) => {
+      const { entityId } = params;
+      const payload = resolveUploadPayload(params as unknown as UploadToolParams, allowLocalFiles);
+      const file = await client.uploadEntityTrainingFile(entityId, payload);
       return jsonTextResult({
         ...summarizeEntityTrainingFile(file),
         message: "Entity training file uploaded.",
@@ -1555,6 +1764,36 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
     })
   );
 
+  // --- list_entity_file_annotations ---
+  s.tool(
+    "list_entity_file_annotations",
+    "List annotations for every test/review file in an entity version. Returns each file's content, annotation spans, metrics, and review status in a single call. If versionId is omitted, the latest available entity version is used. Use this for cross-file review and to bulk-collect LLM annotations once test files have been processed.",
+    {
+      entityId: modelBasedEntityIdSchema,
+      versionId: modelBasedEntityVersionIdSchema.optional().describe("Optional entity version ID. If omitted, the latest available entity version is used."),
+    },
+    withLogging(logger, "list_entity_file_annotations", async ({ entityId, versionId }) => {
+      const resolvedVersionId = versionId ?? await resolveLatestEntityVersionId(client, entityId);
+      const version = await client.getEntityVersion(entityId, resolvedVersionId);
+      // The version endpoint returns a minimal file list (no content/annotations).
+      // Fan out a per-file fetch to collect annotations; the client semaphore
+      // bounds in-flight requests so this is safe for large versions.
+      const filesWithAnnotations = await Promise.all(
+        version.files.map((file) =>
+          client.getEntityFileAnnotations(entityId, version.id, file.fileId)
+        )
+      );
+      return jsonTextResult({
+        entityId,
+        versionId: version.id,
+        versionNumber: version.versionNumber,
+        status: version.status,
+        fileCount: version.files.length,
+        files: filesWithAnnotations.map((file) => summarizeEntityFileAnnotations(file)),
+      });
+    })
+  );
+
   // --- get_entity_file_annotations ---
   s.tool(
     "get_entity_file_annotations",
@@ -1566,7 +1805,7 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
       forcePredictions: z.boolean().optional().describe("If true, force regeneration of predictions before returning file annotations"),
     },
     withLogging(logger, "get_entity_file_annotations", async ({ entityId, versionId, fileId, forcePredictions }) => {
-      const resolvedVersionId = versionId ?? await resolveLatestEntityVersionId(entityId);
+      const resolvedVersionId = versionId ?? await resolveLatestEntityVersionId(client, entityId);
       const file = await client.getEntityFileAnnotations(entityId, resolvedVersionId, fileId, forcePredictions);
       return jsonTextResult({
         entityId,
@@ -1603,8 +1842,8 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
     })
   );
 
-  // --- scan_directory ---
-  s.tool(
+  // --- scan_directory (local-files mode only) ---
+  registerFull(() => registerLocal(() => s.tool(
     "scan_directory",
     "Scan a local directory tree and return an inventory of all files with their types and sizes. Use this to understand the structure before de-identifying.",
     {
@@ -1653,10 +1892,10 @@ Supported formats: PDF, docx, xlsx, PNG, JPG, JPEG, TIF/TIFF.`,
         }],
       };
     })
-  );
+  )));
 
-  // --- deidentify_folder ---
-  s.tool(
+  // --- deidentify_folder (local-files mode only) ---
+  registerFull(() => registerLocal(() => s.tool(
     "deidentify_folder",
     `De-identify an entire folder tree in a single call. This is the PREFERRED tool whenever the user wants to redact, de-identify, or anonymize multiple files or a directory. Do NOT loop over files calling redact_text/redact_file individually, and do NOT write scripts to batch-process files — use this tool instead.
 
@@ -1829,7 +2068,7 @@ Recommended workflow: use scan_directory to preview, test redact_text/redact_jso
           const fileStart = Date.now();
           logger.info("file_redact_start", { tool: "deidentify_folder", file: item.relPath, ext: item.ext, mode: "file_upload" });
           try {
-            const job = await client.startFileRedaction(item.srcFull, signal);
+            const job = await client.startFileRedaction(loadLocalFilePayload(item.srcFull), signal);
             logger.info("file_upload_complete", { tool: "deidentify_folder", file: item.relPath, jobId: job.jobId, durationMs: Date.now() - fileStart });
             binaryJobs.push({ item, jobId: job.jobId });
           } catch (err: unknown) {
@@ -1844,7 +2083,7 @@ Recommended workflow: use scan_directory to preview, test redact_text/redact_jso
         const binaryPromises = binaryJobs.map(({ item, jobId }) => {
           if (signal?.aborted) return Promise.resolve();
           const dlStart = Date.now();
-          return pollAndDownload(jobId, opts, signal).then((redactedBuf) => {
+          return pollAndDownload(client, jobId, opts, signal).then((redactedBuf) => {
             fs.mkdirSync(path.dirname(item.outFilePath), { recursive: true });
             fs.writeFileSync(item.outFilePath, redactedBuf);
             logger.info("file_redact_complete", { tool: "deidentify_folder", file: item.relPath, outputBytes: redactedBuf.length, durationMs: Date.now() - dlStart });
@@ -1894,80 +2133,166 @@ Recommended workflow: use scan_directory to preview, test redact_text/redact_jso
         }],
       };
     })
-  );
+  )));
 }
 
 // ============================================================
 // Start the server
 // ============================================================
+
+interface Session {
+  server: McpServer;
+  transport: StreamableHTTPServerTransport;
+  client: TextualClient;
+  profile: Profile;
+  createdAt: number;
+  lastUsedAt: number;
+}
+
+// Extract the API key from the Authorization header. Supports both raw
+// `Authorization: <key>` (matches Solar's ApiKeyAuthHandler) and
+// `Authorization: Bearer <key>`. Returns null when missing or empty.
+function extractApiKey(req: { headers: NodeJS.Dict<string | string[]> }): string | null {
+  const raw = req.headers["authorization"];
+  const header = Array.isArray(raw) ? raw[0] : raw;
+  if (!header) return null;
+  const trimmed = header.trim();
+  if (!trimmed) return null;
+  const match = trimmed.match(/^Bearer\s+(.+)$/i);
+  const value = match ? match[1].trim() : trimmed;
+  return value.length > 0 ? value : null;
+}
+
+function writeJsonRpcError(
+  res: import("node:http").ServerResponse,
+  status: number,
+  code: number,
+  message: string
+): void {
+  if (res.headersSent) return;
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ jsonrpc: "2.0", error: { code, message }, id: null }));
+}
+
 async function main() {
   const port = parseInt(process.env.PORT || "3000", 10);
+  const url = BASE_URL;
 
-  // Each session gets its own McpServer + Transport pair so that
-  // in-flight request state, abort controllers, and response handlers
-  // are fully isolated between sessions.
-  let currentSession: {
-    server: McpServer;
-    transport: StreamableHTTPServerTransport;
-  } | null = null;
+  // Each session gets its own McpServer + Transport + TextualClient so that
+  // in-flight request state, abort controllers, response handlers, and the
+  // caller's API credential are fully isolated between sessions.
+  const sessions = new Map<string, Session>();
 
-  function createSession(): { server: McpServer; transport: StreamableHTTPServerTransport } {
+  function createSession(apiKey: string, profile: Profile): Session {
     const server = new McpServer({ name: "tonic-textual", version: "1.0.0" }, {
       taskStore: new InMemoryTaskStore(),
     });
-    registerTools(server);
+    const client = new TextualClient(BASE_URL, apiKey, logger, MAX_CONCURRENT, {
+      dispatcher: TEXTUAL_DISPATCHER,
+    });
+    registerTools(server, client, profile, ALLOW_LOCAL_FILES);
+    const now = Date.now();
+    // Forward-declare the session so the SDK callbacks below can capture it
+    // by reference; sessionId is assigned by the transport during the
+    // initialize request via onsessioninitialized.
+    const session: Session = {
+      server,
+      transport: undefined as unknown as StreamableHTTPServerTransport,
+      client,
+      profile,
+      createdAt: now,
+      lastUsedAt: now,
+    };
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
+      onsessioninitialized: (sid: string) => {
+        sessions.set(sid, session);
+        logger.info("session_established", { sessionId: sid, profile, totalSessions: sessions.size });
+      },
     });
-    return { server, transport };
+    transport.onclose = () => {
+      const sid = transport.sessionId;
+      if (sid && sessions.delete(sid)) {
+        logger.info("session_closed", { sessionId: sid, totalSessions: sessions.size });
+      }
+    };
+    session.transport = transport;
+    return session;
   }
+
+  async function initializeSession(apiKey: string, profile: Profile): Promise<Session> {
+    const session = createSession(apiKey, profile);
+    await session.server.connect(session.transport);
+    return session;
+  }
+
+  // Idle-session janitor: evict sessions that have not been used recently so
+  // we don't retain caller credentials in memory longer than necessary.
+  const janitor = setInterval(() => {
+    const now = Date.now();
+    for (const [sid, session] of sessions) {
+      if (now - session.lastUsedAt > SESSION_IDLE_TIMEOUT_MS) {
+        logger.info("session_evicted_idle", { sessionId: sid, idleMs: now - session.lastUsedAt });
+        session.server.close().catch((err) => {
+          logger.error("session_evict_close_error", { sessionId: sid, error: String(err) });
+        });
+        sessions.delete(sid);
+      }
+    }
+  }, SESSION_JANITOR_INTERVAL_MS);
+  janitor.unref();
 
   const httpServer = createServer(async (req, res) => {
     const url = new URL(req.url || "/", `http://localhost:${port}`);
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
     logger.info("http_request", { method: req.method, path: url.pathname, sessionId: sessionId || null });
 
-    if (url.pathname === "/mcp") {
+    // Profile is selected by the connect-time path: /mcp/light → curated
+    // model-based-entity tools; /mcp → full toolset (default).
+    const profile: Profile | null =
+      url.pathname === "/mcp" ? "full" :
+      url.pathname === "/mcp/light" ? "light" :
+      null;
+
+    if (profile !== null) {
       try {
         // Route to existing session if session ID matches
-        if (sessionId && currentSession?.transport.sessionId === sessionId) {
-          await currentSession.transport.handleRequest(req, res);
-          return;
+        if (sessionId) {
+          const existing = sessions.get(sessionId);
+          if (existing) {
+            existing.lastUsedAt = Date.now();
+            await existing.transport.handleRequest(req, res);
+            return;
+          }
         }
 
-        // New initialization: POST without session header
-        if (req.method === "POST" && !sessionId) {
-          logger.info("new_session", { reason: "POST without session header" });
-          if (currentSession) {
-            logger.info("closing_previous_session", { previousSessionId: currentSession.transport.sessionId });
-            await currentSession.server.close();
+        // New initialization or reconnect on a stale session ID. Both require
+        // the Authorization header so we can build a per-session client.
+        if (req.method === "POST") {
+          const apiKey = extractApiKey(req);
+          if (!apiKey) {
+            logger.info("session_init_unauthorized", { reason: "Missing Authorization header", profile });
+            writeJsonRpcError(
+              res,
+              401,
+              -32001,
+              "Missing Authorization header. Provide a Solar API key via 'Authorization: <api-key>'."
+            );
+            return;
           }
-          const session = createSession();
-          await session.server.connect(session.transport);
-          currentSession = session;
-          await session.transport.handleRequest(req, res);
-          logger.info("session_established", { sessionId: session.transport.sessionId });
-          return;
-        }
-
-        // Stale session ID on POST — client's session expired, create a new one
-        if (req.method === "POST" && sessionId) {
-          logger.info("session_expired_reconnect", { expiredSessionId: sessionId });
-          if (currentSession) {
-            await currentSession.server.close();
+          if (sessionId) {
+            logger.info("session_expired_reconnect", { expiredSessionId: sessionId, profile });
+          } else {
+            logger.info("new_session", { reason: "POST without session header", profile });
           }
-          const session = createSession();
-          await session.server.connect(session.transport);
-          currentSession = session;
+          const session = await initializeSession(apiKey, profile);
           await session.transport.handleRequest(req, res);
-          logger.info("session_established", { sessionId: session.transport.sessionId });
           return;
         }
 
         // GET/DELETE with unknown session — nothing to reconnect to
-        logger.info("session_not_found", { method: req.method, sessionId: sessionId || null, currentSessionId: currentSession?.transport.sessionId || null });
-        res.writeHead(404, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32001, message: "Session not found" }, id: null }));
+        logger.info("session_not_found", { method: req.method, sessionId: sessionId || null, profile });
+        writeJsonRpcError(res, 404, -32001, "Session not found");
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         const stack = err instanceof Error ? err.stack : undefined;
@@ -1979,7 +2304,7 @@ async function main() {
       }
     } else if (url.pathname === "/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok" }));
+      res.end(JSON.stringify({ status: "ok", sessions: sessions.size }));
     } else {
       logger.info("http_not_found", { method: req.method, path: url.pathname });
       res.writeHead(404, { "Content-Type": "application/json" });
@@ -1988,7 +2313,19 @@ async function main() {
   });
 
   httpServer.listen(port, () => {
-    logger.info("Tonic Textual MCP server running on HTTP", { port, endpoint: "/mcp" });
+    logger.info("Tonic Textual MCP server running on HTTP", {
+      url,
+      port,
+      endpoints: ["/mcp", "/mcp/light"],
+      allowLocalFiles: ALLOW_LOCAL_FILES,
+      insecureTls: INSECURE_TLS,
+    });
+    if (INSECURE_TLS) {
+      logger.error("insecure_tls_enabled", {
+        message:
+          "TONIC_TEXTUAL_INSECURE_TLS is enabled: TLS certificate verification is DISABLED for outbound calls to TONIC_TEXTUAL_BASE_URL. Use only for self-signed dev/internal Textual instances.",
+      });
+    }
   });
 }
 

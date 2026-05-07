@@ -192,10 +192,32 @@ export function withLogging<TArgs extends Record<string, unknown>, TResult>(
           isError: true,
         } as TResult;
       }
-      const msg = err instanceof Error ? err.message : String(err);
+      let msg = err instanceof Error ? err.message : String(err);
+      // Surface undici fetch's underlying cause (TLS, DNS, ECONNREFUSED, ...)
+      // when present, so the tool-result log isn't a useless "fetch failed".
+      const cause = (err as { cause?: unknown })?.cause;
+      if (cause) {
+        const causeMsg = cause instanceof Error ? cause.message : String(cause);
+        const causeCode = (cause as NodeJS.ErrnoException)?.code;
+        const detail = causeCode ? `${causeCode}: ${causeMsg}` : causeMsg;
+        if (!msg.includes(causeMsg)) msg = `${msg} (${detail})`;
+      }
       const statusCode = (err as any)?.statusCode;
       const endpoint = (err as any)?.endpoint;
       logger.logToolResult(toolName, Date.now() - start, false, msg);
+      // 401/403 from Solar means the per-session API key was rejected. Surface a
+      // clear, action-oriented message to the MCP client without leaking the raw
+      // upstream body; the full detail is already in the server-side log above.
+      if (statusCode === 401 || statusCode === 403) {
+        return {
+          content: [{
+            type: "text" as const,
+            text:
+              "Authentication to Tonic Textual failed. Verify the Authorization header configured in your MCP client points to a valid, non-revoked API key for this server.",
+          }],
+          isError: true,
+        } as TResult;
+      }
       const parts = [`Error: ${msg}`];
       if (statusCode) parts.push(`Status: ${statusCode}`);
       if (endpoint) parts.push(`Endpoint: ${endpoint}`);

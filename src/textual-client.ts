@@ -1,12 +1,25 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { lookup } from "mime-types";
+import { fetch as undiciFetch, FormData as UndiciFormData, type Dispatcher } from "undici";
 import type { Logger } from "./logger.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const packageJson = JSON.parse(fs.readFileSync(path.resolve(__dirname, "..", "package.json"), "utf-8"));
 export const USER_AGENT = `textual-mcp/${packageJson.version} (+https://github.com/TonicAI/textual-mcp)`;
+
+// Node's fetch (undici) wraps low-level network errors in an opaque
+// `TypeError: fetch failed`; the actionable detail (TLS error, DNS failure,
+// ECONNREFUSED, etc.) lives on `err.cause`. Expose it for logs and re-throws
+// so callers don't have to chase it manually.
+function describeFetchError(err: unknown): string {
+  const base = err instanceof Error ? err.message : String(err);
+  const cause = (err as { cause?: unknown })?.cause;
+  if (!cause) return base;
+  const causeMsg = cause instanceof Error ? cause.message : String(cause);
+  const causeCode = (cause as NodeJS.ErrnoException)?.code;
+  return causeCode ? `${base} (${causeCode}: ${causeMsg})` : `${base} (${causeMsg})`;
+}
 
 export interface RedactionEntity {
   start: number;
@@ -61,6 +74,16 @@ export interface FileRedactionJob {
   fileName: string;
 }
 
+// Bytes-in-payload upload contract. The MCP layer is responsible for
+// producing this from either a base64 input (hosted mode) or a local
+// file path (local-files mode); the client itself never reads the
+// caller's filesystem.
+export interface UploadFilePayload {
+  fileName: string;
+  mimeType: string;
+  content: Buffer;
+}
+
 export interface FileJob {
   id: string;
   status: string;
@@ -69,6 +92,7 @@ export interface FileJob {
   endTime: string | null;
   publishedTime: string;
   jobType: string;
+  fileName?: string;
 }
 
 export type GeneratorHandling =
@@ -212,7 +236,7 @@ export interface ModelBasedEntityFileFullApiModel extends ModelBasedEntityFileMi
   groundTruth: ModelBasedEntityAnnotationSpan[];
 }
 
-export interface ModelBasedEntityFileVersionRecordWithAnnotations {
+export interface ModelBasedEntityFileVersionRecordMinimalApiModel {
   id: string;
   fileId: string;
   versionId: string;
@@ -227,6 +251,10 @@ export interface ModelBasedEntityFileVersionRecordWithAnnotations {
   errorType: string | null;
   errorDetails: string | null;
   createdAt: string;
+}
+
+export interface ModelBasedEntityFileVersionRecordWithAnnotations
+  extends ModelBasedEntityFileVersionRecordMinimalApiModel {
   content: string;
   annotations: ModelBasedEntityAnnotationSpan[];
 }
@@ -243,11 +271,15 @@ export interface ModelBasedEntityVersionApiModel {
   status: ModelBasedEntityVersionStatus;
   errorType: string | null;
   errorDetails: string | null;
-  files: ModelBasedEntityFileVersionRecordWithAnnotations[];
+  files: ModelBasedEntityFileVersionRecordMinimalApiModel[];
 }
 
+export type ModelBasedEntitySuggestedGuidelinesStatus = "Pending" | "Ready" | "Failed";
+
 export interface ModelBasedEntitySuggestedGuidelinesApiModel {
+  status: ModelBasedEntitySuggestedGuidelinesStatus;
   guidelines: string;
+  jobId: string | null;
 }
 
 export interface ModelBasedEntityTrainedModelApiModel {
@@ -412,17 +444,35 @@ class Semaphore {
   }
 }
 
+export interface TextualClientOptions {
+  /**
+   * Optional undici Dispatcher used for every fetch call. Lets the caller
+   * customize TLS handling (e.g. an Agent with rejectUnauthorized=false for
+   * self-signed Textual instances) without leaking that concern into the
+   * client itself.
+   */
+  dispatcher?: Dispatcher;
+}
+
 export class TextualClient {
   private baseUrl: string;
   private apiKey: string;
   private logger?: Logger;
   private semaphore: Semaphore;
+  private dispatcher?: Dispatcher;
 
-  constructor(baseUrl: string, apiKey: string, logger?: Logger, maxConcurrent = 50) {
+  constructor(
+    baseUrl: string,
+    apiKey: string,
+    logger?: Logger,
+    maxConcurrent = 50,
+    options: TextualClientOptions = {}
+  ) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
     this.apiKey = apiKey;
     this.logger = logger;
     this.semaphore = new Semaphore(maxConcurrent);
+    this.dispatcher = options.dispatcher;
   }
 
   private isRetryableError(err: unknown): boolean {
@@ -450,17 +500,42 @@ export class TextualClient {
       let lastErr: unknown;
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
-          const res = await fetch(url, { ...options, headers, signal });
+          // When a dispatcher is configured (e.g. for self-signed TLS),
+          // route through undici's own fetch so the Agent and the fetch
+          // implementation come from the same undici version. Otherwise
+          // use the platform fetch.
+          let res: Response;
+          if (this.dispatcher) {
+            res = (await undiciFetch(url, {
+              ...(options as Record<string, unknown>),
+              headers,
+              signal: signal ?? undefined,
+              dispatcher: this.dispatcher,
+            } as Parameters<typeof undiciFetch>[1])) as unknown as Response;
+          } else {
+            res = await fetch(url, { ...options, headers, signal });
+          }
           const durationMs = Date.now() - start;
           if (!res.ok) {
             const body = await res.text().catch(() => "");
             this.logger?.error("api_request_error", { method, endpoint, status: res.status, body, durationMs });
-            let detail = body;
-            try {
-              const parsed = JSON.parse(body);
-              detail = parsed.message || parsed.detail || parsed.title || body;
-            } catch {
-              // body is plain text, use as-is
+            // 401/403 means the per-session API key was rejected by Solar.
+            // Replace the raw upstream body with a clear, actionable message
+            // so callers (including task-based tools that bypass withLogging)
+            // surface something meaningful. Full upstream detail is already in
+            // the server-side log above.
+            let detail: string;
+            if (res.status === 401 || res.status === 403) {
+              detail =
+                "Authentication to Tonic Textual failed. Verify the Authorization header configured in your MCP client points to a valid, non-revoked API key for this server.";
+            } else {
+              detail = body;
+              try {
+                const parsed = JSON.parse(body);
+                detail = parsed.message || parsed.detail || parsed.title || body;
+              } catch {
+                // body is plain text, use as-is
+              }
             }
             const err = new Error(detail);
             (err as any).statusCode = res.status;
@@ -470,8 +545,15 @@ export class TextualClient {
           this.logger?.info("api_request_complete", { method, endpoint, status: res.status, durationMs });
           return res;
         } catch (err) {
+          // Promote the underlying network cause (TLS error, DNS failure,
+          // ECONNREFUSED, etc.) into the message so it shows up in tool
+          // results and logs instead of the opaque "fetch failed".
+          if (err instanceof Error && (err as { cause?: unknown }).cause) {
+            const detailed = describeFetchError(err);
+            if (detailed !== err.message) err.message = detailed;
+          }
           if (attempt === 0 && this.isRetryableError(err)) {
-            this.logger?.info("api_request_retry", { method, endpoint, error: String(err), attempt: attempt + 1 });
+            this.logger?.info("api_request_retry", { method, endpoint, error: describeFetchError(err), attempt: attempt + 1 });
             lastErr = err;
             continue;
           }
@@ -499,55 +581,37 @@ export class TextualClient {
     return JSON.parse(text) as T;
   }
 
-  private getLocalFileForUpload(filePath: string): {
-    resolvedPath: string;
-    fileName: string;
-    fileBuffer: Buffer;
-    mimeType: string;
-  } {
-    const resolvedPath = path.resolve(filePath);
-
-    if (!fs.existsSync(resolvedPath)) {
-      throw new Error(`File does not exist: ${resolvedPath}`);
-    }
-
-    const stats = fs.statSync(resolvedPath);
-    if (!stats.isFile()) {
-      throw new Error(`Path is not a file: ${resolvedPath}`);
-    }
-
-    return {
-      resolvedPath,
-      fileName: path.basename(resolvedPath),
-      fileBuffer: fs.readFileSync(resolvedPath),
-      mimeType: lookup(resolvedPath) || "application/octet-stream",
-    };
-  }
-
   private toBlobPart(fileBuffer: Buffer): ArrayBuffer {
     return Uint8Array.from(fileBuffer).buffer;
   }
 
-  private createModelBasedEntityFileUploadFormData(filePath: string): {
-    formData: FormData;
-  } {
-    const { fileName, fileBuffer, mimeType } = this.getLocalFileForUpload(filePath);
-    const formData = new FormData();
+  // When a dispatcher is configured we route through undici's own fetch
+  // (see request()), which only recognizes FormData instances from its own
+  // module. Using globalThis.FormData with undiciFetch silently serializes
+  // the body as "[object FormData]" with Content-Type text/plain, which the
+  // Textual API rejects with 415. Pick the constructor that matches the
+  // fetch implementation we will actually use.
+  private get FormDataCtor(): typeof FormData {
+    return (this.dispatcher ? UndiciFormData : FormData) as typeof FormData;
+  }
+
+  private createModelBasedEntityFileUploadFormData(payload: UploadFilePayload): FormData {
+    const formData = new this.FormDataCtor();
     formData.append(
       "document",
-      new Blob([JSON.stringify({ fileName })], { type: "application/json" })
+      new Blob([JSON.stringify({ fileName: payload.fileName })], { type: "application/json" })
     );
-    formData.append("file", new Blob([this.toBlobPart(fileBuffer)], { type: mimeType }), fileName);
-    return { formData };
+    formData.append("file", new Blob([this.toBlobPart(payload.content)], { type: payload.mimeType }), payload.fileName);
+    return formData;
   }
 
   private async uploadModelBasedEntityFile<T>(
     entityId: string,
     kind: "test" | "training",
-    filePath: string,
+    payload: UploadFilePayload,
     signal?: AbortSignal
   ): Promise<T> {
-    const { formData } = this.createModelBasedEntityFileUploadFormData(filePath);
+    const formData = this.createModelBasedEntityFileUploadFormData(payload);
     const encodedEntityId = encodeURIComponent(entityId);
     const res = await this.request(`/api/model-based-entities/${encodedEntityId}/${kind}/files`, {
       method: "POST",
@@ -967,17 +1031,13 @@ export class TextualClient {
 
   // --- File Redaction (Unattached) ---
 
-  async startFileRedaction(filePath: string, signal?: AbortSignal): Promise<FileRedactionJob> {
-    const fileName = path.basename(filePath);
-    const fileBuffer = fs.readFileSync(filePath);
-    const mimeType = lookup(filePath) || "application/octet-stream";
-
-    const formData = new FormData();
+  async startFileRedaction(payload: UploadFilePayload, signal?: AbortSignal): Promise<FileRedactionJob> {
+    const formData = new this.FormDataCtor();
     formData.append(
       "document",
       new Blob(
         [JSON.stringify({
-          fileName,
+          fileName: payload.fileName,
           csvConfig: {},
           datasetId: "",
           customPiiEntityIds: [],
@@ -985,14 +1045,14 @@ export class TextualClient {
         { type: "application/json" }
       )
     );
-    formData.append("file", new Blob([this.toBlobPart(fileBuffer)], { type: mimeType }), fileName);
+    formData.append("file", new Blob([this.toBlobPart(payload.content)], { type: payload.mimeType }), payload.fileName);
 
     const res = await this.request("/api/unattachedfile/upload", {
       method: "POST",
       body: formData,
     }, signal);
     const data = await res.json();
-    return { jobId: data.jobId ?? data.id, fileName };
+    return { jobId: data.jobId ?? data.id, fileName: payload.fileName };
   }
 
   async listFileJobs(from?: string): Promise<FileJob[]> {
@@ -1040,17 +1100,13 @@ export class TextualClient {
     });
   }
 
-  async uploadFileToDataset(datasetId: string, filePath: string): Promise<DatasetUploadResponse> {
-    const fileName = path.basename(filePath);
-    const fileBuffer = fs.readFileSync(filePath);
-    const mimeType = lookup(filePath) || "application/octet-stream";
-
-    const formData = new FormData();
+  async uploadFileToDataset(datasetId: string, payload: UploadFilePayload): Promise<DatasetUploadResponse> {
+    const formData = new this.FormDataCtor();
     formData.append(
       "document",
       new Blob(
         [JSON.stringify({
-          fileName,
+          fileName: payload.fileName,
           csvConfig: {},
           datasetId,
           customPiiEntityIds: [],
@@ -1058,7 +1114,7 @@ export class TextualClient {
         { type: "application/json" }
       )
     );
-    formData.append("file", new Blob([this.toBlobPart(fileBuffer)], { type: mimeType }), fileName);
+    formData.append("file", new Blob([this.toBlobPart(payload.content)], { type: payload.mimeType }), payload.fileName);
 
     const res = await this.request(`/api/Dataset/${datasetId}/files/upload`, {
       method: "POST",
@@ -1083,7 +1139,7 @@ export class TextualClient {
 
     const validatedData = data as DatasetUploadResponse;
     const uploadedFile = validatedData.updatedDataset.files.find((file) => file.fileId === validatedData.uploadedFileId)
-      ?? validatedData.updatedDataset.files.find((file) => file.fileName === fileName);
+      ?? validatedData.updatedDataset.files.find((file) => file.fileName === payload.fileName);
     return { ...validatedData, uploadedFile };
   }
 
@@ -1263,7 +1319,10 @@ export class TextualClient {
       `/api/model-based-entities/${encodedEntityId}/versions/${encodedVersionId}/suggested-guidelines`,
       {}
     );
-    return typeof data === "string" ? { guidelines: data } : data;
+    if (typeof data === "string") {
+      return { status: "Ready", guidelines: data, jobId: null };
+    }
+    return data;
   }
 
   async listEntityVersions(entityId: string): Promise<ModelBasedEntityVersionApiModel[]> {
@@ -1344,9 +1403,9 @@ export class TextualClient {
 
   async uploadEntityTestFile(
     entityId: string,
-    filePath: string
+    payload: UploadFilePayload
   ): Promise<ModelBasedEntityFileMinimalApiModel> {
-    return this.uploadModelBasedEntityFile(entityId, "test", filePath);
+    return this.uploadModelBasedEntityFile(entityId, "test", payload);
   }
 
   async listEntityTestFiles(entityId: string): Promise<ModelBasedEntityFileMinimalApiModel[]> {
@@ -1403,9 +1462,9 @@ export class TextualClient {
 
   async uploadEntityTrainingFile(
     entityId: string,
-    filePath: string
+    payload: UploadFilePayload
   ): Promise<ModelBasedEntityTrainingFileApiModel> {
-    return this.uploadModelBasedEntityFile(entityId, "training", filePath);
+    return this.uploadModelBasedEntityFile(entityId, "training", payload);
   }
 
   async listEntityTrainingFiles(
