@@ -53,6 +53,7 @@ The server is configured via environment variables. **No API key is configured a
 | `TONIC_TEXTUAL_POLL_TIMEOUT_SECONDS` | No | `900` | Timeout (in seconds) for polling file processing jobs |
 | `TONIC_TEXTUAL_SESSION_IDLE_TIMEOUT_MS` | No | `1800000` (30 min) | Idle session eviction window |
 | `TONIC_TEXTUAL_LOG_DIR` | No | `./logs` | Directory for structured log files |
+| `TONIC_TEXTUAL_INSECURE_TLS` | No | unset | When set (`true`/`1`/`yes`/`on`), disables TLS certificate verification for outbound calls to `TONIC_TEXTUAL_BASE_URL`. Intended for self-hosted Textual instances using self-signed certificates; do not enable in production. Prefer installing the CA into the system trust store or setting `NODE_EXTRA_CA_CERTS`. |
 
 ## Deployment modes
 

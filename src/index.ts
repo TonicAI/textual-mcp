@@ -9,6 +9,7 @@ import { z } from "zod";
 import fs from "node:fs";
 import path from "node:path";
 import { lookup } from "mime-types";
+import { Agent, type Dispatcher } from "undici";
 import {
   TextualClient,
   type Dataset,
@@ -47,6 +48,14 @@ const SESSION_JANITOR_INTERVAL_MS = 60 * 1000;
 // and may read/write the local filesystem. Default is hosted-mode where
 // only base64 payloads are accepted.
 const ALLOW_LOCAL_FILES = /^(1|true|yes|on)$/i.test(process.env.TONIC_TEXTUAL_ALLOW_LOCAL_FILES ?? "");
+// Opt-in: skip TLS certificate verification on outbound calls to the Textual
+// REST API. Intended for self-hosted instances using self-signed certs; do
+// not enable in production. Scoped to TextualClient via an undici dispatcher
+// so it does not affect the MCP server's own TLS or any other code.
+const INSECURE_TLS = /^(1|true|yes|on)$/i.test(process.env.TONIC_TEXTUAL_INSECURE_TLS ?? "");
+const TEXTUAL_DISPATCHER: Dispatcher | undefined = INSECURE_TLS
+  ? new Agent({ connect: { rejectUnauthorized: false } })
+  : undefined;
 
 // --- Shared schemas ---
 
@@ -2178,7 +2187,9 @@ async function main() {
     const server = new McpServer({ name: "tonic-textual", version: "1.0.0" }, {
       taskStore: new InMemoryTaskStore(),
     });
-    const client = new TextualClient(BASE_URL, apiKey, logger, MAX_CONCURRENT);
+    const client = new TextualClient(BASE_URL, apiKey, logger, MAX_CONCURRENT, {
+      dispatcher: TEXTUAL_DISPATCHER,
+    });
     registerTools(server, client, profile, ALLOW_LOCAL_FILES);
     const now = Date.now();
     // Forward-declare the session so the SDK callbacks below can capture it
@@ -2307,7 +2318,14 @@ async function main() {
       port,
       endpoints: ["/mcp", "/mcp/light"],
       allowLocalFiles: ALLOW_LOCAL_FILES,
+      insecureTls: INSECURE_TLS,
     });
+    if (INSECURE_TLS) {
+      logger.error("insecure_tls_enabled", {
+        message:
+          "TONIC_TEXTUAL_INSECURE_TLS is enabled: TLS certificate verification is DISABLED for outbound calls to TONIC_TEXTUAL_BASE_URL. Use only for self-signed dev/internal Textual instances.",
+      });
+    }
   });
 }
 

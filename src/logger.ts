@@ -192,7 +192,16 @@ export function withLogging<TArgs extends Record<string, unknown>, TResult>(
           isError: true,
         } as TResult;
       }
-      const msg = err instanceof Error ? err.message : String(err);
+      let msg = err instanceof Error ? err.message : String(err);
+      // Surface undici fetch's underlying cause (TLS, DNS, ECONNREFUSED, ...)
+      // when present, so the tool-result log isn't a useless "fetch failed".
+      const cause = (err as { cause?: unknown })?.cause;
+      if (cause) {
+        const causeMsg = cause instanceof Error ? cause.message : String(cause);
+        const causeCode = (cause as NodeJS.ErrnoException)?.code;
+        const detail = causeCode ? `${causeCode}: ${causeMsg}` : causeMsg;
+        if (!msg.includes(causeMsg)) msg = `${msg} (${detail})`;
+      }
       const statusCode = (err as any)?.statusCode;
       const endpoint = (err as any)?.endpoint;
       logger.logToolResult(toolName, Date.now() - start, false, msg);
